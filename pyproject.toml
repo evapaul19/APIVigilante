@@ -8,7 +8,20 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.0",
+    "fastapi>=0.143.2",
+    "google-genai>=2.29.0",
     "httpx>=0.28.1",
+    "langchain>=1.4.6",
+    "langgraph>=1.2.15",
+    "openai>=3.26.1",
+    "openapi-spec-validator>=0.9.0",
+    "prance>=26.7.19.0",
+    "psycopg[binary]>=3.3.6",
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.4",
+    "sqlmodel>=0.0.48",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]

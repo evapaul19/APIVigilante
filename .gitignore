@@ -1,6 +1,7 @@
-﻿.venv/
+﻿.env
+.env.*
+!.env.example
+.venv/
 __pycache__/
-*.pyc
-.env
 .pytest_cache/
-.vscode/
+*.py[cod]
