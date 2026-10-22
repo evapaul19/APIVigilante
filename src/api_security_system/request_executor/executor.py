@@ -12,19 +12,23 @@ string (e.g. target.base_url), consistent with Recon's parser.py and
 classifier.py being free of DB dependencies.
 """
 
+import json
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from .pinned import PinnedAddressTransport
 from .schemas import (
     ExecutionRequest,
     ExecutionResult,
     TargetOriginError,
     TransportError,
 )
+
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 
 def _build_target_url(base_url: str, path: str) -> str:
@@ -149,6 +153,7 @@ class RequestExecutor:
         self,
         base_url: str,
         transport: Optional[httpx.BaseTransport] = None,
+        pinned_addresses: Optional[Sequence[str]] = None,
     ) -> None:
         # Validate the configured base URL at construction time.
         parsed_base = urlsplit(base_url)
@@ -180,8 +185,52 @@ class RequestExecutor:
 
         self._base_url = base_url.rstrip("/")
 
+        if transport is not None and pinned_addresses is not None:
+            raise TargetOriginError(
+                "A custom transport cannot be combined with pinned addresses."
+            )
+
+        if pinned_addresses is not None:
+            if isinstance(pinned_addresses, str):
+                raise TargetOriginError(
+                    "Pinned addresses must be a sequence of IP literals."
+                )
+            addresses = tuple(str(address).strip() for address in pinned_addresses)
+            if not addresses or any(not address for address in addresses):
+                raise TargetOriginError(
+                    "At least one pinned IP address is required."
+                )
+
+            try:
+                raw_host = httpx.URL(base_url).raw_host
+                pinned_host = raw_host.decode("ascii") if raw_host else ""
+            except (httpx.InvalidURL, UnicodeDecodeError) as exc:
+                raise TargetOriginError(
+                    "Target base_url contains an invalid hostname."
+                ) from exc
+            if not pinned_host:
+                raise TargetOriginError(
+                    "Target base_url must include a hostname."
+                )
+            effective_port = parsed_base.port or (
+                443 if parsed_base.scheme.lower() == "https" else 80
+            )
+
+            try:
+                transport = PinnedAddressTransport(
+                    pinned_host,
+                    effective_port,
+                    addresses,
+                )
+            except ValueError as exc:
+                raise TargetOriginError(str(exc)) from exc
+
         # Redirects remain disabled so credentials cannot be forwarded
-        # automatically to another destination.
+        # automatically to another destination. Supplying a custom transport
+        # also disables HTTPX's automatic environment-proxy discovery; this
+        # is intentional for pinned requests because a proxy could bypass the
+        # validated address set. Pinned requests fail closed without a direct
+        # route.
         self._client = httpx.Client(
             transport=transport,
             follow_redirects=False,
@@ -191,16 +240,32 @@ class RequestExecutor:
         url = _build_target_url(self._base_url, request.path)
 
         start = time.monotonic()
+        content = bytearray()
+        response_status = 0
+        response_headers: dict[str, str] = {}
+        response_encoding: Optional[str] = None
 
         try:
-            response = self._client.request(
+            with self._client.stream(
                 method=request.method,
                 url=url,
                 headers=request.headers,
                 params=request.query_params or None,
                 json=request.json_body,
                 timeout=request.timeout_seconds,
-            )
+            ) as response:
+                response_status = response.status_code
+                response_headers = dict(response.headers)
+                response_encoding = response.encoding
+
+                for chunk in response.iter_bytes():
+                    content.extend(chunk)
+                    if len(content) > MAX_RESPONSE_BYTES:
+                        raise TransportError(
+                            "Response exceeded the "
+                            f"{MAX_RESPONSE_BYTES} byte limit for "
+                            f"{request.method} {request.path}."
+                        )
         except httpx.TimeoutException as exc:
             raise TransportError(
                 f"Request timed out after {request.timeout_seconds}s: "
@@ -219,25 +284,28 @@ class RequestExecutor:
         response_body: Optional[dict] = None
         response_body_raw: Optional[str] = None
 
-        if response.content:
+        if content:
+            text = bytes(content).decode(
+                response_encoding or "utf-8", errors="replace"
+            )
             try:
-                parsed_body = response.json()
+                parsed_body = json.loads(text)
                 if isinstance(parsed_body, dict):
                     response_body = parsed_body
                 else:
                     # Preserve valid JSON arrays, strings, numbers, and
                     # booleans rather than silently discarding them.
-                    response_body_raw = response.text
-            except ValueError:
-                response_body_raw = response.text
+                    response_body_raw = text
+            except (ValueError, RecursionError):
+                response_body_raw = text
 
         return ExecutionResult(
             request_method=request.method,
             request_path=request.path,
             request_headers=dict(request.headers),
             request_body=request.json_body,
-            response_status=response.status_code,
-            response_headers=dict(response.headers),
+            response_status=response_status,
+            response_headers=response_headers,
             response_body=response_body,
             response_body_raw=response_body_raw,
             latency_ms=elapsed_ms,

@@ -5,3 +5,16 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+targets/fetched-*
+*.bak
+submission-output/
+tests/test_bola.py
+tests/test_frameworks.py
+tests/test_import.py
+tests/test_persistence.py
+tests/test_report.py
+tests/test_step2.py
+tests/test_step3.py
+tests/test_task4.py
+tests/test_with_env.py
+tests/test_workflow.py

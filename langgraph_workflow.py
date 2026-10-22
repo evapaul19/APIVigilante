@@ -13,6 +13,7 @@ Project root is resolved from this file's location for OpenAPI spec path resolut
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -38,6 +39,13 @@ class WorkflowState(BaseModel):
     findings_persisted: bool = Field(default=False, description="Findings saved to DB")
     request_budget: int = Field(default=20, description="Remaining request budget")
     llm_calls: int = Field(default=0, description="Number of LLM calls made")
+    allow_identity_registration: bool = Field(
+        default=False,
+        description="Explicit approval for active BOLA/BFLA checks",
+    )
+    bola_status: str = Field(
+        default="not_run", description="BOLA/BFLA workflow outcome"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -48,6 +56,7 @@ def validate_target(state: WorkflowState, llm_client=None) -> Dict[str, Any]:
     """Validate that the scan exists and the target is the authorized origin."""
     from api_security_system.db import get_session, Scan, Target, Scan, Target
     from api_security_system.authz_bola.service import UnauthorizedTargetError
+    from api_security_system.targets.security import is_authorized_origin
 
     session = get_session()
     scan = session.get(Scan, state.scan_id)
@@ -62,10 +71,9 @@ def validate_target(state: WorkflowState, llm_client=None) -> Dict[str, Any]:
         }
 
     # Authorized origin check - same as authz_bola service
-    authorized_origin = "http://localhost:5000"
-    if target.base_url != authorized_origin:
+    if not is_authorized_origin(target.base_url):
         return {
-            "error": f"BOLA testing is only authorized against {authorized_origin!r}, got {target.base_url!r}.",
+            "error": f"BOLA testing is not authorized against {target.base_url!r}.",
             "stage": "failed",
         }
 
@@ -207,29 +215,45 @@ def select_stage_node(state: WorkflowState) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────
 
 def run_bola_node(state: WorkflowState, db=None, llm_client=None) -> Dict[str, Any]:
-    """Run the BOLA security assessment module."""
-    from api_security_system.authz_bola.service import run_bola_check
-    from api_security_system.db import get_session, Scan, Target
+    """Run the BOLA security assessment module.
 
-    session = db if db else get_session()
+    Active checks are opt-in, matching POST /assessments. Without explicit
+    approval the workflow stops after recon and the graph stage rather than
+    pretending authorization checks ran.
+    """
+    from api_security_system.authz_bola.service import run_bola_check
+
+    if not state.allow_identity_registration:
+        return {
+            "stage": "persist",
+            "findings_persisted": False,
+            "bola_status": "not_run",
+            "error": None,
+        }
 
     try:
         result = run_bola_check(
             scan_id=state.scan_id,
-            allow_identity_registration=False,
+            allow_identity_registration=True,
             request_budget=state.request_budget,
         )
         return {
             "stage": "persist",
-            "findings_persisted": True,
+            "findings_persisted": any(
+                item.finding_id is not None
+                for item in result.endpoint_results + result.bfla_results
+            ),
+            "bola_status": "stopped_early" if result.stopped_early else "performed",
             "error": None,
         }
     except PermissionError as exc:
-        return {"error": str(exc), "stage": "failed"}
+        return {"error": str(exc), "stage": "failed", "bola_status": "failed"}
     except Exception as exc:
-        return {"error": f"BOLA assessment failed: {exc}", "stage": "failed"}
-    finally:
-        state.request_budget = max(0, state.request_budget - 5)  # conservative budget tracking
+        return {
+            "error": f"BOLA assessment failed: {exc}",
+            "stage": "failed",
+            "bola_status": "failed",
+        }
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -301,15 +325,20 @@ def build_workflow() -> Any:
 # CLI entry point for running the workflow directly
 # ──────────────────────────────────────────────────────────────────
 
-def run_workflow(scan_id: int, budget: int = 20) -> Dict[str, Any]:
+def run_workflow(
+    scan_id: int,
+    budget: int = 20,
+    allow_identity_registration: bool = False,
+) -> Dict[str, Any]:
     """Run the full security assessment workflow for a given scan."""
-    from api_security_system.db import get_session, Scan, Target, Scan, Target
-    from sqlmodel import select as sql_select
-
     app = build_workflow()
 
     # Initialize state
-    initial_state = WorkflowState(scan_id=scan_id, request_budget=budget)
+    initial_state = WorkflowState(
+        scan_id=scan_id,
+        request_budget=budget,
+        allow_identity_registration=allow_identity_registration,
+    )
 
     # Run the workflow
     final_state = None
@@ -379,10 +408,11 @@ def llm_classify_endpoint(endpoint, llm_client) -> Any:
 # ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import json
-
     if len(sys.argv) < 2:
-        print("Usage: python langgraph_workflow.py <scan_id> [--budget N]")
+        print(
+            "Usage: python langgraph_workflow.py <scan_id> [--budget N] "
+            "[--allow-active]"
+        )
         sys.exit(1)
 
     scan_id = int(sys.argv[1])
@@ -393,5 +423,9 @@ if __name__ == "__main__":
             budget = int(sys.argv[i + 1])
 
     print(f"Running APIVigilante LangGraph workflow for scan_id={scan_id}, budget={budget}")
-    result = run_workflow(scan_id=scan_id, budget=budget)
+    result = run_workflow(
+        scan_id=scan_id,
+        budget=budget,
+        allow_identity_registration="--allow-active" in sys.argv,
+    )
     print(json.dumps(result, indent=2, default=str))

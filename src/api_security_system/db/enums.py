@@ -29,6 +29,8 @@ class FindingSeverity(str, Enum):
 
 class FindingType(str, Enum):
     BOLA = "bola"
+    BFLA = "bfla"
+    SENSITIVE_DATA = "sensitive_data"
     # New vulnerability categories are added here as agents land —
     # no migration needed, since the column is a plain string.
 

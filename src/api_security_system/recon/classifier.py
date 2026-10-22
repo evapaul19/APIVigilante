@@ -30,10 +30,19 @@ except Exception:
     # dotenv is optional; if it fails, we simply rely on os.environ.
     pass
 
-CLASSIFIER_MODEL = "gemini-3.5-flash-lite"
+CLASSIFIER_MODELS = {
+    "google": os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+    "openrouter": os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash"),
+}
 MAX_ATTEMPTS = 2
 RETRY_DELAY_SECONDS = 2
 
+# Provider ordering — used when LLM_PROVIDER is not set explicitly.
+PROVIDER_ORDERING = ["google", "openrouter"]
+_PROVIDER_KEY_ENV = {
+    "google": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
 
 _SYSTEM_PROMPT = (
     "You are a security triage assistant classifying API endpoints by risk. "
@@ -47,10 +56,11 @@ _SYSTEM_PROMPT = (
 
 
 class ClassificationError(Exception):
-    """Raised when an endpoint could not be classified after retries.
+    """Raised when an endpoint could not be classified after all retries
+    have been exhausted.
 
     Callers (service.py) catch this and preserve the endpoint record
-    without a classification, rather than failing the whole scan.
+    without a risk_classification, rather than failing the whole scan.
     """
 
     def __init__(self, operation_id: str | None, path: str, original: Exception) -> None:
@@ -70,53 +80,105 @@ def _build_prompt(endpoint: ParsedEndpoint) -> str:
     )
 
 
-def _classify_with_retries(endpoint: ParsedEndpoint, llm_client: LLMClient) -> RiskClassification:
-    """Run the LLM classification with exactly MAX_ATTEMPTS attempts.
+def _resolve_provider() -> tuple[Provider, str]:
+    """Pick a provider: explicit LLM_PROVIDER, else the first with a key.
 
-    Raises ClassificationError if all attempts fail.
+    If no key is configured, fall back to the first configured ordering
+    entry so mocked callers (tests) still exercise the retry logic; the
+    real provider will raise a clear missing-key error when called.
     """
-    last_error: Exception | None = None
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            response = llm_client.generate(
-                LLMRequest(
-                    provider=Provider.GOOGLE,
-                    model=CLASSIFIER_MODEL,
-                    prompt=_build_prompt(endpoint),
-                    system=_SYSTEM_PROMPT,
-                    max_tokens=256,
-                    temperature=0.0,
-                )
+    explicit = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    if explicit:
+        if explicit not in CLASSIFIER_MODELS:
+            raise ValueError(
+                f"Unsupported LLM_PROVIDER {explicit!r}; "
+                f"expected one of {sorted(CLASSIFIER_MODELS)}."
             )
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = raw.strip("`")
-                if raw.lower().startswith("json"):
-                    raw = raw[4:].strip()
+        return Provider(explicit), CLASSIFIER_MODELS[explicit]
 
-            parsed = json.loads(raw)
-            return RiskClassification(**parsed)
+    for name in PROVIDER_ORDERING:
+        if os.environ.get(_PROVIDER_KEY_ENV[name]):
+            return Provider(name), CLASSIFIER_MODELS[name]
 
-        except Exception as exc:  # noqa: BLE001 - API errors, JSON errors, schema errors
-            last_error = exc
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAY_SECONDS)
+    default_name = PROVIDER_ORDERING[0]
+    return Provider(default_name), CLASSIFIER_MODELS[default_name]
 
-    raise ClassificationError(endpoint.operation_id, endpoint.path, last_error)
+
+def _classify_with_provider(
+    endpoint: ParsedEndpoint,
+    llm_client: LLMClient,
+    provider: Provider,
+    model: str,
+) -> tuple[Optional[RiskClassification], Optional[Exception]]:
+    """Run a single classification attempt with the given provider.
+
+    Returns (classification, error) — if classification succeeds, error is None.
+    If it fails, error contains the exception details.
+    """
+    try:
+        response = llm_client.generate(
+            LLMRequest(
+                provider=provider,
+                model=model,
+                prompt=_build_prompt(endpoint),
+                system=_SYSTEM_PROMPT,
+                max_tokens=256,
+                temperature=0.0,
+            )
+        )
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+
+        parsed = json.loads(raw)
+        return RiskClassification(**parsed), None
+
+    except Exception as exc:  # noqa: BLE001 - API errors, JSON errors, schema errors
+        return None, exc
 
 
 def classify_endpoint(endpoint: ParsedEndpoint, llm_client: LLMClient) -> RiskClassification:
     """Classify a single endpoint's risk level via the LLM.
 
-    Retries up to MAX_ATTEMPTS times (currently 2). If all attempts
-    fail — missing credentials, API error, malformed JSON, schema
-    validation failure — ClassificationError is raised and callers
-    preserve the endpoint record without a risk_classification.
+    Retries up to MAX_ATTEMPTS times using the selected provider
+    (LLM_PROVIDER, else the first provider with a configured key).
+    If all attempts fail, ClassificationError is raised.
 
     Returns a RiskClassification model instance on success.
+    Callers should catch ClassificationError and leave the endpoint's
+    risk_classification as None (unclassified) rather than failing the
+    whole scan.
     """
     try:
-        return _classify_with_retries(endpoint, llm_client)
-    except ClassificationError:
-        raise
+        prov, model = _resolve_provider()
+    except (ValueError, IndexError) as exc:
+        raise ClassificationError(
+            endpoint.operation_id, endpoint.path,
+            RuntimeError(
+                "No configured LLM provider. Set GEMINI_API_KEY or "
+                f"OPENROUTER_API_KEY in your .env file. ({exc})"
+            ),
+        ) from exc
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            classification, error = _classify_with_provider(
+                endpoint, llm_client, prov, model
+            )
+            if classification is not None:
+                return classification
+            last_error = error
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECONDS)
+        except ClassificationError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECONDS)
+
+    raise ClassificationError(endpoint.operation_id, endpoint.path, last_error)

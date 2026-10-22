@@ -4,7 +4,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import CheckConstraint, Column, String
+from sqlalchemy import CheckConstraint, Column, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -46,6 +46,32 @@ class Scan(SQLModel, table=True):
     endpoints: list["Endpoint"] = Relationship(back_populates="scan")
     test_identities: list["TestIdentity"] = Relationship(back_populates="scan")
     findings: list["Finding"] = Relationship(back_populates="scan")
+
+
+class AssessmentStage(SQLModel, table=True):
+    """Persisted outcome of one assessment stage for a scan.
+
+    One row per stage per scan. `details` holds stage-specific counts and
+    check results only; secrets must be sanitized before persistence.
+    """
+
+    __tablename__ = "assessment_stages"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_id",
+            "stage_name",
+            name="uq_assessment_stages_scan_id_stage_name",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_id: int = Field(foreign_key="scans.id")
+    stage_name: str
+    sequence: int
+    status: str = Field(sa_column=Column(String(64)))
+    reason: Optional[str] = None
+    details: dict = Field(default_factory=dict, sa_column=Column(JSONB))
+    recorded_at: datetime = Field(default_factory=_utcnow)
 
 
 class Endpoint(SQLModel, table=True):

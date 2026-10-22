@@ -1,7 +1,7 @@
 [project]
 name = "api-security-system"
 version = "0.1.0"
-description = "Add your description here"
+description = "OpenAPI-driven API security assessment system with bounded BOLA, BFLA, and sensitive-data checks"
 readme = "README.md"
 authors = [
     { name = "Evangelin Paul", email = "Evangelin.paul@hotmail.com" }

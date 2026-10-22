@@ -23,6 +23,7 @@ class AttemptOutcome(str, Enum):
     CONFIRMED = "confirmed"
     RULED_OUT = "ruled_out"
     AMBIGUOUS = "ambiguous"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class BolaCandidate(BaseModel):
@@ -36,6 +37,23 @@ class BolaCandidate(BaseModel):
     path: str
     operation_id: Optional[str] = None
     id_param_name: str
+    summary: Optional[str] = None
+    description: Optional[str] = None
+
+
+class BflaCandidate(BaseModel):
+    """An operation that documentation semantics say requires a higher
+    privilege. Deliberately independent of Resource Graph IDENTIFIES
+    edges (e.g. /me or DELETE /users/{username} need not be object-level
+    BOLA candidates to be BFLA candidates)."""
+
+    endpoint_id: int
+    method: str
+    path: str
+    operation_id: Optional[str] = None
+    id_param_name: Optional[str] = None
+    signal: str
+    rationale: str
 
 
 class EndpointTestResult(BaseModel):
@@ -47,6 +65,7 @@ class EndpointTestResult(BaseModel):
     operation_id: Optional[str] = None
     path: str
     outcome: AttemptOutcome
+    check_type: str = "bola"
     attempt_execution_id: Optional[int] = None
     verification_execution_ids: list[int] = Field(default_factory=list)
     finding_id: Optional[int] = None
@@ -54,12 +73,16 @@ class EndpointTestResult(BaseModel):
 
 
 class BolaCheckResult(BaseModel):
-    """The full result of one BOLA MVP run against the 'user' resource."""
+    """The full result of one authorization-check run against the 'user'
+    resource. BOLA and BFLA results are kept separate."""
 
     scan_id: int
     target_base_url: str
     requests_used: int
     request_budget: int
     endpoint_results: list[EndpointTestResult] = Field(default_factory=list)
+    bfla_results: list[EndpointTestResult] = Field(default_factory=list)
+    bfla_status: str = "not_run"
+    bfla_reason: Optional[str] = None
     stopped_early: bool = False
     stopped_reason: Optional[str] = None

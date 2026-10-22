@@ -2,7 +2,16 @@
 
 from .engine import get_engine, get_session
 from .enums import FindingSeverity, FindingStatus, FindingType, ScanStatus
-from .models import Endpoint, Finding, FindingEvidence, Scan, Target, TestExecution, TestIdentity
+from .models import (
+    AssessmentStage,
+    Endpoint,
+    Finding,
+    FindingEvidence,
+    Scan,
+    Target,
+    TestExecution,
+    TestIdentity,
+)
 
 __all__ = [
     "get_engine",
@@ -12,6 +21,7 @@ __all__ = [
     "Endpoint",
     "TestIdentity",
     "TestExecution",
+    "AssessmentStage",
     "Finding",
     "FindingEvidence",
     "FindingSeverity",

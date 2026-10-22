@@ -1,215 +1,422 @@
 # APIVigilante: API Security Assessment System
 
-## Overview
+APIVigilante is an OpenAPI-driven API security assessment prototype. It
+discovers endpoints from a target's specification, builds a deterministic
+resource graph, runs bounded authorization and sensitive-data checks against
+explicitly authorized origins, and persists sanitized evidence and stage-aware
+reports in PostgreSQL.
 
-APIVigilante is an API security assessment system that performs:
-- OpenAPI specification discovery and endpoint inventory
-- LLM-based risk classification
-- BOLA (Broken Object Level Authorization) vulnerability testing
-- Resource graph construction
-- Persistence of results to PostgreSQL
+Implemented checks:
 
-## Quick Start
+- OpenAPI/Swagger discovery and deterministic endpoint inventory.
+- Optional LLM risk classification (Google Gemini or OpenRouter).
+- BOLA checks for the documented email-update, password-update, and delete
+  operations, plus read-only BOLA on object-level authenticated GET endpoints.
+- BFLA checks for authenticated operations documented as administrator-only,
+  currently the administrator-DELETE execution shape.
+- Sensitive-data inspection of actual JSON responses, with confirmed findings
+  and evidence-backed candidates.
+- Redacted evidence persistence, findings, and stage-aware reports.
+- Explicit target authorization, SSRF protections, bounded execution, shared
+  request budgets, and an isolated local test API.
 
-### Prerequisites
+Active testing is never implicit. It requires
+`allow_identity_registration=true` on `POST /assessments` and an origin that is
+explicitly allowlisted. Other targets can be inventoried, but active checks are
+reported as `not_supported`.
 
-- Docker Desktop 4.95.0 or later
-- Python 3.12+
-- 2 GB+ available memory
+## Architecture
 
-### 1. Start Infrastructure
+The supported application flow is `POST /assessments`:
 
-Start the PostgreSQL and VAmPI containers:
+1. Validate the target URL and optional OpenAPI spec URL.
+2. Acquire the spec and save it locally.
+3. Persist the endpoint inventory (recon).
+4. Optionally classify endpoints with an LLM.
+5. Build the resource graph from persisted endpoints.
+6. Run BOLA/BFLA checks when active testing is approved.
+7. Inspect GET responses for sensitive data within the remaining budget.
+8. Persist the nine assessment-stage outcomes and return report links.
 
-```bash
+The main modules are under `src/api_security_system/`:
+
+```text
+api.py                 FastAPI routes, findings, and report assembly
+auth/                  Registration/login helpers and AuthContext
+authz_bola/            Candidate selection, BOLA/BFLA runners, verification
+db/                    SQLModel models, enums, engine, redaction
+llm/                   Provider abstraction
+recon/                 OpenAPI parsing, inventory, optional classification
+request_executor/      SSRF-safe HTTP execution and response limits
+resource_graph/        Deterministic resource relationships
+sensitive_data/        Response inspection and finding creation
+targets/               URL/spec validation, authorization, orchestration
+safe_gets.py           Shared GET side-effect classifier
+```
+
+`langgraph_workflow.py` is an optional, legacy scan-driven workflow wrapper.
+It is not used by the supported `POST /assessments` path. It requires
+`--allow-active` before it will run authorization checks.
+
+## Prerequisites
+
+- Docker Desktop with Compose.
+- Python 3.12 or newer.
+- The existing project virtual environment at `.venv`.
+- PostgreSQL reachable through the configured `DATABASE_URL`.
+- About 2 GB of available memory.
+
+## 1. Configure Environment
+
+Copy the template and edit `.env` locally. If `.env` already exists, edit it in
+place; do not overwrite existing secrets.
+
+```powershell
+Copy-Item .env.example .env
+```
+
+At minimum, set database values matching the existing PostgreSQL volume:
+
+```dotenv
+DATABASE_URL=postgresql+psycopg://api_security:CHANGE_ME@localhost:5432/api_security
+POSTGRES_PASSWORD=CHANGE_ME
+```
+
+Never commit `.env` or print its contents. `.gitignore` excludes `.env` and
+other local environment files. The application loads `.env` from the project
+root even when the process is started from another directory.
+
+### Authorized target origins
+
+Active checks are limited to explicitly allowlisted origins:
+
+- `http://localhost:5000` (the bundled VAmPI contract).
+- `http://127.0.0.1:5001` only when this opt-in is set:
+
+```dotenv
+APIVIGILANTE_ENABLE_TEST_TARGET=1
+```
+
+The second origin exists for the isolated vulnerable test API in
+`vulnerable_test_api/`. It is exact-origin gated; do not enable it for a
+different loopback service and do not expose that test API beyond loopback.
+
+### Optional LLM classification
+
+Set one key in `.env`:
+
+```dotenv
+GEMINI_API_KEY=your-key
+# or
+OPENROUTER_API_KEY=your-key
+```
+
+Optional controls:
+
+- `LLM_PROVIDER=google|openrouter` forces a provider.
+- `GEMINI_MODEL` and `OPENROUTER_MODEL` override model names.
+- Without a key, use `classify=false`. Otherwise classification is attempted
+  and reported as failed or partial while the deterministic inventory remains
+  persisted.
+
+### BFLA administrator identity
+
+BFLA needs a higher-privileged identity that already exists on the target:
+
+```dotenv
+VAMPI_ADMIN_USERNAME=your-admin-user
+VAMPI_ADMIN_PASSWORD=your-admin-password
+```
+
+There is no credential fallback. If either value is missing, or the identity
+does not verify as an administrator, BFLA reports `unsupported`; it does not
+guess credentials.
+
+## 2. Start Infrastructure
+
+The repository's Compose file starts PostgreSQL only:
+
+```powershell
 docker compose up -d
+docker compose ps
+docker compose exec postgres pg_isready -U api_security
 ```
 
-Wait for both containers to turn healthy:
-- PostgreSQL on port 5432
-- VAmPI on port 5000
+The VAmPI container, if used, is managed separately. Do not remove or recreate
+the PostgreSQL volume. If the volume already exists, its password must match
+`POSTGRES_PASSWORD` and `DATABASE_URL`.
 
-### 2. Configure Environment
+For a self-contained demonstration, start the isolated test API on loopback
+from the project root:
 
-Copy the example environment file and ensure the following are set:
-
-```bash
-cp .env.example .env
+```powershell
+& .\.venv\Scripts\python.exe -m uvicorn vulnerable_test_api.app:app --host 127.0.0.1 --port 5001
 ```
 
-The `.env` file should contain:
+That API is intentionally vulnerable and intended only for local verification.
+Do not expose it to a network.
 
-```
-DATABASE_URL=postgresql+psycopg://api_security:MyDbPass_82x@localhost:5432/api_security
-GEMINI_API_KEY=your_gemini_key_here
-OPENROUTER_API_KEY=your_openrouter_key_here
-POSTGRES_PASSWORD=MyDbPass_82x
-TARGET_BASE_URL=http://localhost:5000
-```
+## 3. Apply Database Migrations
 
-**Note:** The `GEMINI_API_KEY` and `OPENROUTER_API_KEY` are required for LLM-based endpoint classification. Without these, the system will discover and persist endpoints but classifications will fail gracefully.
+The schema is managed with Alembic. The current head is
+`3f2a9c1d4b7e` (the `assessment_stages` table). Run from the project root so
+the root `.env` is loaded:
 
-### 3. Start the FastAPI Application
-
-Using the project CLI entry point:
-
-```bash
-api-security-system
+```powershell
+& .\.venv\Scripts\python.exe -m alembic current
+& .\.venv\Scripts\python.exe -m alembic upgrade head
+& .\.venv\Scripts\python.exe -m alembic current
 ```
 
-Or using uvicorn directly:
+Do not run `alembic downgrade`, reset volumes, or delete records as part of
+normal startup. Existing historical scans are read using their persisted
+stages and findings.
 
-```bash
-uv run uvicorn api_security_system.api:app --host 127.0.0.1 --port 8000
+## 4. Start the API
+
+Using the existing virtual environment:
+
+```powershell
+& .\.venv\Scripts\python.exe -m uvicorn api_security_system.api:app --host 127.0.0.1 --port 8000
 ```
 
-The API will be available at `http://127.0.0.1:8000`.
+Alternative entry point:
 
-### 4. Create a Scan
-
-```bash
-curl -X POST http://127.0.0.1:8000/scans \
-  -H "Content-Type: application/json" \
-  -d '{"target_id": 353}'
+```powershell
+& .\.venv\Scripts\api-security-system.exe
 ```
 
-Target 353 is `bola-test-target` at `http://localhost:5000`. You can list targets with the database queries below.
+The API, Swagger UI, and health check are at:
 
-### 5. Trigger Reconnaissance
+- Swagger UI: `http://127.0.0.1:8000/docs`
+- OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
+- Health: `http://127.0.0.1:8000/health`
 
-```bash
-curl -X POST http://127.0.0.1:8000/scans/{scan_id}/recon
+If port 8000 is already in use, stop the old process or choose a different
+port. Startup requires a reachable PostgreSQL database and a `.env` with
+`DATABASE_URL`.
+
+## 5. Run an Assessment
+
+`POST /assessments` is the main one-call flow. It creates the target and scan,
+acquires the spec, runs recon, optionally classifies endpoints, builds the
+resource graph, and runs supported active checks when explicitly approved.
+
+Inventory-only baseline (no active requests, optional classification):
+
+```powershell
+$body = @{
+  base_url = "http://127.0.0.1:5001"
+  openapi_spec_url = "http://127.0.0.1:5001/openapi.json"
+  target_name = "isolated-vulnerable-test-api"
+  classify = $false
+  allow_identity_registration = $false
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/assessments" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
-This will:
-- Parse the target's OpenAPI specification
-- Persist 14 endpoint inventory records
-- Run LLM-based risk classification (requires API keys)
+Active assessment against the explicitly allowlisted isolated test API:
 
-### 6. Authorized BOLA Testing
+```powershell
+$body = @{
+  base_url = "http://127.0.0.1:5001"
+  openapi_spec_url = "http://127.0.0.1:5001/openapi.json"
+  target_name = "isolated-vulnerable-test-api"
+  classify = $false
+  allow_identity_registration = $true
+  request_budget = 40
+} | ConvertTo-Json
 
-```bash
-curl -X POST http://127.0.0.1:8000/scans/{scan_id}/bola \
-  -H "Content-Type: application/json" \
-  -d '{"allow_identity_registration": true}'
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/assessments" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
-**Important:** The BOLA safety gate requires explicit `allow_identity_registration=true`. This is a security feature - BOLA testing is not enabled by default.
+Notes:
 
-### 7. Retrieve Findings
+- `request_budget` is 1-100.
+- BOLA/BFLA and sensitive-data checks share that budget. Sensitive inspection
+  receives only what BOLA/BFLA did not use and is additionally capped at 20.
+- `openapi_spec_url` must share the target origin. When omitted, common
+  discovery paths are tried.
+- `classify=false` avoids an LLM call. It does not disable deterministic
+  checks.
 
-```bash
-curl -X GET http://127.0.0.1:8000/scans/{scan_id}/findings
+Retrieve the persisted report and findings:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/scans/{scan_id}/report"
+Invoke-RestMethod "http://127.0.0.1:8000/scans/{scan_id}/findings"
 ```
 
-Returns a list of findings with type, severity, status, and evidence references.
+The findings endpoint includes endpoint method/path and
+`evidence_execution_ids`. The report includes sanitized request/response
+evidence, so it is the authoritative place to review a finding.
 
-### 8. Run the Test Suite
+## 6. Read the Report
 
-```bash
-python -m pytest tests/ -v
+The report uses persisted stage records as the authority for what actually ran.
+Important fields include:
+
+- `assessment.complete`: true only when the scan completed, endpoints exist,
+  and no incomplete reason was recorded.
+- `assessment.stages_persisted` and `assessment.stage_source`: distinguish new
+  stage-aware scans from legacy scans using `legacy_fallback`.
+- `assessment.incomplete_reasons`: explicit skipped, unsupported, partial, and
+  failed outcomes.
+- `assessment.checks.recon`, `classification`, `resource_graph`,
+  `authorization_tests`, `bola`, `bfla`, `sensitive_data`, `persistence`, and
+  `report`.
+- `findings_by_status`: `candidate` means evidence is suggestive but not
+  confirmed; `confirmed` means deterministic post-condition verification
+  succeeded.
+- `findings[].evidence`: redacted execution records linked to that finding.
+
+Stage statuses are intentionally explicit: `passed`, `succeeded`, `completed`,
+`built`, `performed`, `not_requested`, `not_run`, `not_applicable`,
+`unsupported`, `not_supported`, `partial`, `stopped_early`, or `failed`.
+Finding statuses are `candidate`, `confirmed`, or `false_positive`. Finding
+types are `bola`, `bfla`, or `sensitive_data`.
+
+Legacy scans without stage rows still return a report using
+`stage_source: "legacy_fallback"`. Missing active-check evidence is not treated
+as a clean result.
+
+## API Routes
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| GET | `/health` | Application and database health |
+| POST | `/assessments` | One-call assessment and stage-aware response |
+| POST | `/scans` | Create a pending scan for an existing target |
+| GET | `/scans/{scan_id}` | Scan lifecycle status |
+| GET | `/scans/{scan_id}/findings` | Persisted findings with endpoint/evidence references |
+| GET | `/scans/{scan_id}/report` | Full report with stage outcomes and evidence |
+| POST | `/scans/{scan_id}/recon` | Manual recon for an existing scan |
+| POST | `/scans/{scan_id}/bola-check` | Manual BOLA/BFLA run |
+
+Manual `/recon` and `/bola-check` routes are for targeted reruns. They do not
+replace the stage-aware `POST /assessments` flow.
+
+## BOLA/BFLA Behavior
+
+BOLA write checks are tied to the documented operation IDs
+`api_views.users.update_email`, `api_views.users.update_password`, and
+`api_views.users.delete_user`. Each check provisions disposable identities,
+performs an attacker attempt, and verifies the effect through an independent
+post-condition. A 2xx attempt alone is not a finding.
+
+Read-only BOLA selects authenticated GET endpoints with exactly one
+substitutable path parameter. Username parameters are substituted directly.
+Numeric/UUID parameters are tested only when the identity's own authenticated
+`GET /me` document exposes a unique field matching the parameter; otherwise the
+candidate is reported `not_applicable` rather than guessed. Confirmation
+requires a successful own-object read carrying the caller's marker, a different
+successful cross-object read carrying the target's marker, and no caller marker
+in the cross response. Public or marker-less responses are ruled out.
+
+GETs classified as side-effect-prone are never executed.
+
+BFLA is independent of object-level BOLA selection. It requires an operation
+whose OpenAPI summary/description says it is administrator-only, a matching
+supported execution shape (currently administrator DELETE), and a configured
+administrator identity that verifies as an administrator. Missing credentials
+or an unverified privilege boundary produces `unsupported`, not a finding.
+
+## Security Safeguards
+
+- URL validation rejects embedded credentials, fragments, dot-segments, and
+  unsafe schemes.
+- SSRF protections reject private, loopback, link-local, reserved, multicast,
+  non-global (including CGNAT), and metadata addresses unless the exact origin
+  is explicitly allowlisted.
+- Authorized loopback hostnames such as `localhost` may resolve only to
+  loopback addresses.
+- Assessment validation resolves the target once; spec acquisition and active
+  authorization/sensitive-data checks reuse that result, and every connection
+  is pinned to the validated addresses.
+- Active checks are closed by default and require explicit approval.
+- Request execution disables redirects, applies timeouts, and limits response
+  size.
+- Pinned spec fetching uses a custom HTTPX transport, which disables automatic
+  environment-proxy discovery. This is intentional: a proxy could otherwise
+  bypass the validated address set. Pinned requests fail closed when a direct
+  route is unavailable; proxy integration must be explicit and must not
+  re-resolve the target hostname.
+- BOLA/BFLA and sensitive-data checks use bounded request budgets.
+- Evidence is redacted before persistence; secrets and tokens are not written
+  to findings or logs.
+- `.env` is local-only and excluded from version control.
+
+## Known Limitations
+
+- Authentication testing is currently unsupported and is not wired into the
+  assessment pipeline. The previous experimental authentication-testing module
+  was removed because it was incomplete and unsafe to run. Its absence must not
+  be interpreted as a completed authentication check.
+- Assessment validation pins the target's resolved addresses for the duration
+  of the run. If the target changes IP mid-assessment, active checks fail closed
+  rather than re-resolving; start a new assessment after the change.
+- Active identity provisioning follows the VAmPI-compatible registration and
+  login contract (`POST /users/v1/register`, `POST /users/v1/login`) and uses
+  `GET /me` for ownership/privilege evidence. Targets with a different auth
+  contract can still be inventoried, but active checks may report
+  not-applicable or unsupported.
+- BOLA write detection is intentionally limited to the three known operation
+  shapes. Other mutation endpoints are reported as not applicable rather than
+  guessed.
+- Read-only BOLA requires a single path identifier and ownership evidence in
+  the response. Numeric/UUID checks depend on `GET /me` exposing a matching
+  identifier; otherwise they are skipped.
+- BFLA currently supports administrator-only DELETE operations only and needs
+  an existing administrator identity in `.env`.
+- Sensitive-data detection inspects JSON GET responses only; it is not a
+  general data-flow or secret-scanning engine.
+- Classification is optional and depends on an external LLM provider. A
+  missing key or provider failure does not block deterministic checks.
+- The optional `langgraph_workflow.py` wrapper is legacy; the supported
+  submission and report path is `POST /assessments`.
+- The repository contains older script-style test files that perform live
+  calls. Do not include them in automated validation.
+
+## Verification Notes
+
+For validation, first use static/import checks, then the focused suites below,
+and only afterward a controlled live assessment against `127.0.0.1:5001` if
+explicitly approved. Database-backed tests are skipped automatically when
+`DATABASE_URL` is unset; when it is set, use only a test database or the
+repository's disposable test fixtures.
+
+A safe focused test command, excluding script-style live-call files, is:
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest `
+  tests\test_authz_bola_classifier.py `
+  tests\test_authz_bola_service.py `
+  tests\test_authz_bola_verification.py `
+  tests\test_auth_module.py `
+  tests\test_db_redaction.py `
+  tests\test_recon_classifier.py `
+  tests\test_recon_parser.py `
+  tests\test_recon_service.py `
+  tests\test_request_executor.py `
+  tests\test_resource_graph_builder.py `
+  tests\test_safe_gets.py `
+  tests\test_sensitive_data.py `
+  tests\test_target_dns_pinning.py `
+  tests\test_pinned_tls.py `
+  tests\test_bola_route_security.py `
+  tests\test_test_target_authorization.py `
+  tests\test_vulnerable_test_api_profile.py -v
 ```
 
-All 75 tests pass. See `TEST_RESULTS.md` for detailed output.
-
-### 9. Database Queries (admin)
-
-```bash
-psql "postgresql+psycopg://api_security:MyDbPass_82x@localhost:5432/api_security" -c "
-  SELECT id, status, started_at, completed_at FROM scan ORDER BY id DESC LIMIT 5;
-  SELECT id, path, method, risk_classification FROM endpoint ORDER BY id DESC LIMIT 14;
-  SELECT id, type, severity, status FROM finding ORDER BY id DESC LIMIT 10;
-"
-```
-
-## Project Structure
-
-```
-api-security-system/
-├── Dockerfile              # Docker configuration
-├── docker-compose.yml      # PostgreSQL + VAmPI services
-├── .env                   # Environment configuration (create from .env.example)
-├── .env.example           # Example environment variables
-├── pyproject.toml         # Project configuration & CLI entry point
-├── src/
-│   ├── api_security_system/
-│   │   ├── __init__.py    # Entry point: api-security-system command
-│   │   ├── api.py         # FastAPI application with 7 routes
-│   │   ├── langgraph_workflow.py  # 6-node StateGraph workflow
-│   │   ├── recon/
-│   │   │   ├── service.py     # Recon orchestration
-│   │   ├── parser.py        # OpenAPI spec parsing
-│   │   ├── classifier.py    # LLM-based risk classification
-│   │   └── schemas.py       # Pydantic models
-│   ├── authz_bola/
-│   │   ├── service.py     # BOLA orchestration
-│   │   └── schemas.py     # BOLA result models
-│   ├── llm/               # LLM client utilities
-│   ├── request_executor/  # Deterministic HTTP request sender
-│   ├── resource_graph/    # Resource graph builder
-│   └── db/                # Database engine and session management
-├── tests/                 # 75 passing tests
-├── targets/               # OpenAPI spec files
-├── alemic/                # Database migration history
-└── README.md              # This file
-```
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /health | Report application and database health |
-| POST | /scans | Create a pending scan for an existing target |
-| GET | /scans/{scan_id} | Retrieve a scan's current lifecycle state |
-| GET | /scans/{scan_id}/findings | List findings persisted for a scan |
-| POST | /scans/{scan_id}/recon | Trigger reconnaissance for a scan |
-
-**BOLA endpoint** (not documented in FastAPI but functional):
-- POST /scans/{scan_id}/bola with `{"allow_identity_registration": true}`
-
-## Test Suite
-
-Run all tests:
-
-```bash
-python -m pytest tests/ -v
-```
-
-**Result:** 75 passed, 0 failed, 0 errors
-
-## Environment Variables
-
-| Variable | Required | Default/Description |
-|----------|----------|---------------------|
-| `DATABASE_URL` | Yes | `postgresql+psycopg://api_security:MyDbPass_82x@localhost:5432/api_security` |
-| `GEMINI_API_KEY` | Yes (for LLM classification) | Your Google Gemini API key |
-| `OPENROUTER_API_KEY` | Yes (for LLM classification) | Your OpenRouter API key |
-| `POSTGRES_PASSWORD` | Yes | `MyDbPass_82x` |
-| `TARGET_BASE_URL` | Yes | `http://localhost:5000` |
-
-## Docker Compose
-
-```bash
-docker compose up -d
-```
-
-Services:
-- `api-security-system-postgres-1`: PostgreSQL 17 on port 5432
-- `vampi`: VAmPI API on port 5000
-
-## MCP Server
-
-The project includes MCP (Multi-Command Protocol) server support for integration with AI assistants. The MCP server can be started with:
-
-```bash
-python -m mcp_server
-```
-
-(See `mcp_server.py` for implementation details - this is an optional addon.)
-
-## Limitations
-
-- LLM classification requires `GEMINI_API_KEY` and `OPENROUTER_API_KEY` environment variables
-- BOLA testing requires explicit `allow_identity_registration=true` parameter
-- In-memory checkpoint resume: workflow state is checkpointed within the same process; cross-process resume requires external checkpoint storage (Redis/postgres)
-- The `api-security-system` CLI command starts the FastAPI server; the `uvicorn` command is an alternative
+The DNS-pinning and TLS tests use fake transports or a loopback-only local TLS
+server; they do not contact an external network. Do not run the script-style
+files (`test_task4.py`, `test_frameworks.py`, `test_workflow.py`,
+`test_with_env.py`, and other ad-hoc step scripts) in an automated suite; they
+may open database sessions or contact live targets.
