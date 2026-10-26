@@ -20,6 +20,18 @@ def test_redact_headers_lowercase_authorization():
     assert redacted["authorization"] == REDACTED_VALUE
 
 
+def test_redact_headers_redacts_custom_credential_headers():
+    headers = {
+        "X-Company-Key": "secret-key",
+        "X-Auth-Token": "secret-token",
+        "X-Request-Id": "keep-me",
+    }
+    redacted = redact_headers_for_persistence(headers)
+    assert redacted["X-Company-Key"] == REDACTED_VALUE
+    assert redacted["X-Auth-Token"] == REDACTED_VALUE
+    assert redacted["X-Request-Id"] == "keep-me"
+
+
 def test_redact_headers_does_not_mutate_input():
     headers = {"Authorization": "Bearer abc123"}
     redact_headers_for_persistence(headers)

@@ -1,10 +1,12 @@
 """URL validation and SSRF protection for assessment targets.
 
-The system sends HTTP requests only to an explicitly authorized origin
-(the local VAmPI instance) plus public internet origins that the user
-supplies. Anything that resolves to a private, loopback, link-local,
-reserved, multicast, or unspecified address is rejected unless it is
-one of the explicitly authorized origins.
+User-supplied and operator-allowlisted targets must resolve only to public
+addresses. The built-in VAmPI origin and explicitly enabled local test
+origins are narrow exceptions that must resolve only to loopback addresses.
+
+The target itself is always supplied at runtime. The allowlists below are
+security policy, not a fixed assessment target; operators can add exact
+origins through environment variables without editing the workflow.
 """
 
 from __future__ import annotations
@@ -15,15 +17,21 @@ import socket
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-# The only origin for which the existing authorization tests are
-# enabled. This is a security boundary, not a convenience setting.
+# The default VAmPI-compatible origin remains allowlisted for backwards
+# compatibility. Operators can add exact, additional origins without editing
+# source code. These are security boundaries, not convenience settings.
 DEFAULT_AUTHORIZED_ORIGIN = "http://localhost:5000"
 AUTHORIZED_ORIGINS = frozenset({DEFAULT_AUTHORIZED_ORIGIN})
+AUTHORIZED_ORIGINS_ENV = "APIVIGILANTE_AUTHORIZED_ORIGINS"
+USER_AUTHORIZED_TARGETS_ENV = "APIVIGILANTE_ALLOW_USER_AUTHORIZED_TARGETS"
 
-# A single, exact loopback origin for the isolated test API. It is
-# disabled unless the explicit opt-in environment flag is set.
+# Exact loopback origin(s) for isolated test APIs. They are disabled unless
+# the explicit opt-in flag is set. The default keeps the bundled test API
+# working; APIVIGILANTE_TEST_TARGET_ORIGINS replaces it with a comma-separated
+# list of exact origins.
 TEST_ONLY_AUTHORIZED_ORIGIN = "http://127.0.0.1:5001"
 TEST_ONLY_ORIGIN_ENV = "APIVIGILANTE_ENABLE_TEST_TARGET"
+TEST_ONLY_ORIGINS_ENV = "APIVIGILANTE_TEST_TARGET_ORIGINS"
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 _BLOCKED_HOSTNAMES = frozenset(
@@ -66,11 +74,15 @@ def _split_http_url(url: str):
 
 
 def origin_of(url: str) -> str:
-    """Return the scheme://host:port origin of a validated http(s) URL."""
+    """Return the normalized scheme://host:port origin of a validated URL.
+
+    Default ports are omitted so an explicit ``:80``/``:443`` compares equal
+    to the same origin without a port.
+    """
     parts, hostname, port = _split_http_url(url)
     scheme = parts.scheme.lower()
     host_part = f"[{hostname}]" if ":" in hostname else hostname
-    if port is None:
+    if port is None or port == (443 if scheme == "https" else 80):
         return f"{scheme}://{host_part}"
     return f"{scheme}://{host_part}:{port}"
 
@@ -112,17 +124,6 @@ def _ip_is_public(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def _requires_loopback_resolution(hostname: str) -> bool:
-    normalized = hostname.rstrip(".").lower()
-    if normalized == "localhost" or normalized.endswith(".localhost"):
-        return True
-    try:
-        ip = ipaddress.ip_address(normalized)
-    except ValueError:
-        return False
-    return _canonical_ip(ip).is_loopback
-
-
 def _is_loopback_address(address: str) -> bool:
     try:
         ip = ipaddress.ip_address(str(address).split("%", 1)[0])
@@ -131,12 +132,19 @@ def _is_loopback_address(address: str) -> bool:
     return _canonical_ip(ip).is_loopback
 
 
-def _require_loopback_if_needed(hostname: str, addresses: tuple[str, ...]) -> None:
-    if _requires_loopback_resolution(hostname) and not all(
-        _is_loopback_address(address) for address in addresses
-    ):
+def _is_local_test_origin(origin: str) -> bool:
+    """Whether this exact origin is permitted to resolve only to loopback."""
+    if origin == DEFAULT_AUTHORIZED_ORIGIN:
+        return True
+    return test_only_origin_enabled() and origin in test_only_authorized_origins()
+
+
+def _require_loopback_addresses(
+    hostname: str, addresses: tuple[str, ...]
+) -> None:
+    if not all(_is_loopback_address(address) for address in addresses):
         raise TargetValidationError(
-            f"Authorized loopback host '{hostname}' resolved to a non-loopback "
+            f"Local test target '{hostname}' resolved to a non-loopback "
             f"address ({', '.join(addresses)}); refusing to connect."
         )
 
@@ -194,9 +202,14 @@ def _resolve_authorized_addresses(
     hostname: str,
     port: int | None,
     scheme: str,
+    *,
+    local_test_origin: bool,
 ) -> tuple[str, ...]:
-    addresses = _resolve_addresses(hostname, port, scheme, allow_private=True)
-    _require_loopback_if_needed(hostname, addresses)
+    addresses = _resolve_addresses(
+        hostname, port, scheme, allow_private=local_test_origin
+    )
+    if local_test_origin:
+        _require_loopback_addresses(hostname, addresses)
     return addresses
 
 
@@ -230,10 +243,79 @@ def test_only_origin_enabled() -> bool:
     )
 
 
+def user_authorized_targets_enabled() -> bool:
+    """Return whether the operator allows per-assessment public targets.
+
+    This is a second, server-side gate. A caller cannot enable active
+    testing for a non-allowlisted target merely by setting a request field;
+    the operator must also opt in with an environment variable.
+    """
+    return (
+        os.environ.get(USER_AUTHORIZED_TARGETS_ENV, "").strip().lower()
+        in _TRUE_VALUES
+    )
+
+
+def is_active_test_authorized(
+    url: str,
+    *,
+    authorized_for_active_testing: bool = False,
+) -> bool:
+    """Return whether active requests may be sent to ``url``.
+
+    Allowlisted origins keep their existing authorization. Other targets
+    become eligible only when both the server-side opt-in is enabled and
+    the caller explicitly confirms authorization for this assessment. The
+    target must still pass the SSRF/public-address policy during
+    ``resolve_target``; this helper does not relax address validation.
+    """
+    if is_authorized_origin(url):
+        return True
+    return bool(authorized_for_active_testing) and user_authorized_targets_enabled()
+
+
+def _configured_origins(raw: str | None) -> frozenset[str]:
+    """Parse comma-separated exact origins; invalid entries fail closed."""
+    if not raw:
+        return frozenset()
+
+    origins: set[str] = set()
+    for value in raw.split(","):
+        candidate = value.strip()
+        if not candidate:
+            continue
+        try:
+            parts, _hostname, _port = _split_http_url(candidate)
+        except TargetValidationError:
+            continue
+        if parts.path not in {"", "/"} or parts.query or parts.fragment:
+            continue
+        origins.add(origin_of(candidate))
+    return frozenset(origins)
+
+
+def extra_authorized_origins() -> frozenset[str]:
+    """Return operator-configured exact origins for active testing."""
+    return _configured_origins(os.environ.get(AUTHORIZED_ORIGINS_ENV))
+
+
+def test_only_authorized_origins() -> frozenset[str]:
+    """Return exact origins enabled only by explicit test mode.
+
+    If the origins variable is set, it replaces the bundled default; this
+    prevents a typo from silently enabling the default test origin.
+    """
+    raw = os.environ.get(TEST_ONLY_ORIGINS_ENV)
+    if raw is not None:
+        return _configured_origins(raw)
+    return frozenset({TEST_ONLY_AUTHORIZED_ORIGIN})
+
+
 def authorized_origins() -> frozenset[str]:
+    origins = AUTHORIZED_ORIGINS | extra_authorized_origins()
     if test_only_origin_enabled():
-        return AUTHORIZED_ORIGINS | frozenset({TEST_ONLY_AUTHORIZED_ORIGIN})
-    return AUTHORIZED_ORIGINS
+        origins = origins | test_only_authorized_origins()
+    return origins
 
 
 def is_authorized_origin(url: str) -> bool:
@@ -274,14 +356,14 @@ def validate_resolved_target(
             "Resolved target does not match the requested target URL."
         )
 
-    allow_private = origin in authorized_origins()
+    local_test_origin = _is_local_test_origin(origin)
     addresses = _validated_ip_addresses(
         hostname,
         resolved.addresses,
-        allow_private=allow_private,
+        allow_private=local_test_origin,
     )
-    if allow_private:
-        _require_loopback_if_needed(hostname, addresses)
+    if local_test_origin:
+        _require_loopback_addresses(hostname, addresses)
     return addresses
 
 
@@ -339,7 +421,10 @@ def resolve_target(url: str, *, resolve_authorized: bool = True) -> ResolvedTarg
     if origin in authorized_origins():
         if resolve_authorized:
             addresses = _resolve_authorized_addresses(
-                hostname, port, scheme
+                hostname,
+                port,
+                scheme,
+                local_test_origin=_is_local_test_origin(origin),
             )
         else:
             try:

@@ -63,10 +63,21 @@ SENSITIVE_BODY_FIELD_NAMES = {
 }
 
 
+def _is_sensitive_header_name(name: str) -> bool:
+    lowered = str(name or "").strip().lower()
+    if lowered in SENSITIVE_HEADER_NAMES:
+        return True
+    parts = re.split(r"[^a-z0-9]+", lowered)
+    return any(
+        part in {"auth", "authorization", "token", "key", "apikey", "secret", "cookie", "password"}
+        for part in parts
+    )
+
+
 def redact_headers_for_persistence(headers: dict) -> dict:
     """Case-insensitive match on header name. Returns a new dict."""
     return {
-        key: (REDACTED_VALUE if key.lower() in SENSITIVE_HEADER_NAMES else value)
+        key: (REDACTED_VALUE if _is_sensitive_header_name(key) else value)
         for key, value in headers.items()
     }
 

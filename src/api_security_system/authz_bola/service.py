@@ -31,7 +31,15 @@ from api_security_system.db import (
     TestIdentity,
     get_session,
 )
-from api_security_system.auth import AuthContext, AuthenticationError, AuthModule, Credentials
+from api_security_system.auth import (
+    AuthContext,
+    AuthenticationError,
+    AuthModule,
+    AuthProfile,
+    Credentials,
+    ProfileIdentity,
+    resolve_profile_identities,
+)
 from api_security_system.auth.auth_module import LOGIN_PATH
 from api_security_system.db.redaction import (
     redact_body_for_persistence,
@@ -47,6 +55,7 @@ from .candidate_selector import (
     is_read_candidate,
     select_bfla_candidates,
     select_bola_candidates,
+    select_read_candidates,
 )
 from .classifier import generate_ambiguous_rationale
 from .identity_provisioner import provision_identity
@@ -148,17 +157,18 @@ def _attempt_login_capture(executor, username: str, password: str) -> ExecutionR
 
 def _build_result(
     scan_id: int, candidate: BolaCandidate, outcome: AttemptOutcome,
-    execution_ids: list[int], llm_client: LLMClient,
+    execution_ids: list[int], llm_client: LLMClient, *, read_only: bool = False,
 ) -> EndpointTestResult:
     finding_id = None
     rationale = None
 
     if outcome == AttemptOutcome.CONFIRMED:
+        action = "read access to" if read_only else "access/modification of"
         finding_id = _create_finding(
             scan_id, candidate, FindingStatus.CONFIRMED, FindingSeverity.HIGH,
-            f"Cross-identity BOLA confirmed on {candidate.method} {candidate.path}: "
-            f"deterministic post-condition verification established unauthorized "
-            f"access/modification of another identity's resource.",
+            f"Cross-identity BOLA confirmed on {candidate.method} {candidate.path}. "
+            f"Deterministic post-condition verification established unauthorized "
+            f"{action} another identity's resource.",
             execution_ids,
         )
     elif outcome == AttemptOutcome.AMBIGUOUS:
@@ -742,6 +752,190 @@ def _run_read_checks(
     return results, stopped_early, stopped_reason
 
 
+def _run_profile_read_checks(
+    scan_id: int,
+    executor,
+    attacker: ProfileIdentity,
+    victim: ProfileIdentity,
+    candidates: list[BolaCandidate],
+    llm_client: Optional[LLMClient],
+) -> tuple[list[EndpointTestResult], bool, Optional[str]]:
+    """Read-only BOLA for caller-supplied identities.
+
+    Each candidate is tested with the attacker's own headers against both
+    the attacker's and victim's path values for every path parameter. Only
+    GET operations selected by ``select_read_candidates`` reach this
+    function. No mutation or VAmPI-specific verification endpoint is used.
+    """
+    results: list[EndpointTestResult] = []
+    stopped_early = False
+    stopped_reason = None
+
+    for candidate in candidates:
+        restriction = get_get_side_effect_reason(
+            candidate.path,
+            candidate.operation_id,
+            {
+                "summary": candidate.summary,
+                "description": candidate.description,
+            },
+            candidate.method,
+        )
+        if restriction:
+            results.append(
+                EndpointTestResult(
+                    operation_id=candidate.operation_id,
+                    path=candidate.path,
+                    outcome=AttemptOutcome.NOT_APPLICABLE,
+                    rationale=restriction,
+                )
+            )
+            continue
+
+        parameters = candidate.path_params or re.findall(
+            r"\{([^{}]+)\}", candidate.path
+        )
+        if not parameters:
+            results.append(
+                EndpointTestResult(
+                    operation_id=candidate.operation_id,
+                    path=candidate.path,
+                    outcome=AttemptOutcome.NOT_APPLICABLE,
+                    rationale=(
+                        "The candidate has no path parameter to substitute; "
+                        "no cross-identity request was sent."
+                    ),
+                )
+            )
+            continue
+
+        own_path = candidate.path
+        cross_path = candidate.path
+        missing_parameters: list[str] = []
+        identical_parameters: list[str] = []
+        for parameter in parameters:
+            identifier_is_name = identifier_is_username(parameter)
+            own_identifier = attacker.value_for(
+                parameter, username_identifier=identifier_is_name
+            )
+            cross_identifier = victim.value_for(
+                parameter, username_identifier=identifier_is_name
+            )
+            if own_identifier is None or cross_identifier is None:
+                missing_parameters.append(parameter)
+                continue
+            if str(own_identifier) == str(cross_identifier):
+                identical_parameters.append(parameter)
+                continue
+            own_path = own_path.replace(
+                f"{{{parameter}}}", str(own_identifier)
+            )
+            cross_path = cross_path.replace(
+                f"{{{parameter}}}", str(cross_identifier)
+            )
+
+        if missing_parameters:
+            joined = ", ".join(f"'{name}'" for name in missing_parameters)
+            results.append(
+                EndpointTestResult(
+                    operation_id=candidate.operation_id,
+                    path=candidate.path,
+                    outcome=AttemptOutcome.NOT_APPLICABLE,
+                    rationale=(
+                        f"Path parameter(s) {joined} have no configured value "
+                        "for both identities in the auth profile; no request was sent."
+                    ),
+                )
+            )
+            continue
+        if identical_parameters:
+            joined = ", ".join(f"'{name}'" for name in identical_parameters)
+            results.append(
+                EndpointTestResult(
+                    operation_id=candidate.operation_id,
+                    path=candidate.path,
+                    outcome=AttemptOutcome.NOT_APPLICABLE,
+                    rationale=(
+                        f"Both profile identities resolved to the same value for "
+                        f"path parameter(s) {joined}; no cross-identity read can "
+                        "be tested."
+                    ),
+                )
+            )
+            continue
+
+        try:
+            own_response = executor.execute(
+                ExecutionRequest(
+                    method="GET",
+                    path=own_path,
+                    headers=dict(attacker.headers),
+                )
+            )
+            execution_ids = [
+                _persist_execution(
+                    scan_id, candidate.endpoint_id, attacker.identity_id, own_response
+                )
+            ]
+
+            cross_response = executor.execute(
+                ExecutionRequest(
+                    method="GET",
+                    path=cross_path,
+                    headers=dict(attacker.headers),
+                )
+            )
+            execution_ids.append(
+                _persist_execution(
+                    scan_id, candidate.endpoint_id, attacker.identity_id, cross_response
+                )
+            )
+        except BudgetExceededError as exc:
+            stopped_early = True
+            stopped_reason = str(exc)
+            results.append(
+                EndpointTestResult(
+                    operation_id=candidate.operation_id,
+                    path=candidate.path,
+                    outcome=AttemptOutcome.AMBIGUOUS,
+                    rationale=(
+                        "Read-only BOLA test did not complete because the "
+                        f"request budget was exhausted: {exc}"
+                    ),
+                )
+            )
+            break
+        except TransportError as exc:
+            results.append(
+                EndpointTestResult(
+                    operation_id=candidate.operation_id,
+                    path=candidate.path,
+                    outcome=AttemptOutcome.AMBIGUOUS,
+                    rationale=f"Test could not complete: {exc}",
+                )
+            )
+            continue
+
+        outcome = verify_cross_identity_read(
+            own_response,
+            cross_response,
+            caller_markers=attacker.markers(),
+            target_markers=victim.markers(),
+        )
+        results.append(
+            _build_result(
+                scan_id,
+                candidate,
+                outcome,
+                execution_ids,
+                llm_client,
+                read_only=True,
+            )
+        )
+
+    return results, stopped_early, stopped_reason
+
+
 _ADMIN_USERNAME_ENV = "VAMPI_ADMIN_USERNAME"
 _ADMIN_PASSWORD_ENV = "VAMPI_ADMIN_PASSWORD"
 
@@ -1131,11 +1325,13 @@ def run_bola_check(
     request_budget: int = DEFAULT_REQUEST_BUDGET,
     executor_transport: Optional[httpx.BaseTransport] = None,
     resolved_target: Optional["ResolvedTarget"] = None,
+    auth_profile: Optional[AuthProfile] = None,
+    authorized_for_active_testing: bool = False,
 ) -> BolaCheckResult:
     if not allow_identity_registration:
         raise PermissionError(
-            "BOLA testing requires registering disposable identities against the "
-            "target. Pass allow_identity_registration=True to explicitly approve this."
+            "BOLA testing requires active testing to be explicitly approved. "
+            "Pass allow_identity_registration=True to confirm this."
         )
 
     budget = RequestBudget(max_requests=request_budget)
@@ -1149,15 +1345,27 @@ def run_bola_check(
 
     from api_security_system.targets.security import (
         authorized_origins,
-        is_authorized_origin,
+        is_active_test_authorized,
         resolve_target,
+        user_authorized_targets_enabled,
         validate_resolved_target,
     )
 
-    if not is_authorized_origin(base_url):
+    if not is_active_test_authorized(
+        base_url,
+        authorized_for_active_testing=authorized_for_active_testing,
+    ):
+        if user_authorized_targets_enabled():
+            raise UnauthorizedTargetError(
+                "BOLA testing requires per-assessment authorization for this "
+                f"target, or an explicitly allowlisted origin {sorted(authorized_origins())}, "
+                f"got {base_url!r}."
+            )
         raise UnauthorizedTargetError(
             "BOLA testing is only authorized against the explicitly "
-            f"allowlisted origins {sorted(authorized_origins())}, got {base_url!r}."
+            f"allowlisted origins {sorted(authorized_origins())}, or when "
+            "the operator enables per-assessment public-target authorization, "
+            f"got {base_url!r}."
         )
 
     llm_client = llm_client or LLMClient()
@@ -1186,6 +1394,59 @@ def run_bola_check(
     result = BolaCheckResult(scan_id=scan_id, target_base_url=base_url, requests_used=0, request_budget=request_budget)
 
     try:
+        if auth_profile is not None:
+            result.bfla_status = "not_supported"
+            result.bfla_reason = (
+                "Generic auth profiles run read-only BOLA here; "
+                "administrator-only write testing remains VAmPI-specific."
+            )
+            if auth_profile.type == "none":
+                return result
+            try:
+                identities = resolve_profile_identities(
+                    auth_profile,
+                    executor,
+                    scan_id,
+                    "bola",
+                )
+            except (AuthenticationError, TransportError, BudgetExceededError, ValueError) as exc:
+                result.stopped_early = True
+                result.stopped_reason = (
+                    "Auth profile could not be resolved "
+                    f"({type(exc).__name__}: {exc}); no BOLA requests were sent."
+                )
+                return result
+
+            if len(identities) < 2:
+                result.bfla_status = "not_applicable"
+                result.bfla_reason = (
+                    "Read-only BOLA requires at least two auth-profile identities."
+                )
+                return result
+
+            candidates = select_read_candidates(scan_id)
+            if not candidates:
+                result.bfla_status = "not_applicable"
+                result.bfla_reason = (
+                    "No authenticated GET endpoint with at least one path "
+                    "parameter was found for profile-based BOLA."
+                )
+                return result
+
+            read_results, read_stopped, read_reason = _run_profile_read_checks(
+                scan_id,
+                executor,
+                identities[0],
+                identities[1],
+                candidates,
+                llm_client,
+            )
+            result.endpoint_results.extend(read_results)
+            if read_stopped:
+                result.stopped_early = True
+                result.stopped_reason = read_reason
+            return result
+
         # BOLA: object-level, Resource-Graph selected.
         bola_candidates = {
             c.operation_id: c

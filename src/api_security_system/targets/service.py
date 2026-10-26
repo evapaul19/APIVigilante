@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from sqlalchemy import inspect
 from sqlmodel import select
 
+from api_security_system.auth import AuthProfile
 from api_security_system.authz_bola.service import run_bola_check
 from api_security_system.db import (
     AssessmentStage,
+    Endpoint,
     Finding,
+    FindingEvidence,
     Scan,
     ScanStatus,
     Target,
@@ -26,13 +32,18 @@ from api_security_system.sensitive_data import (
 )
 
 from .security import (
+    ResolvedTarget,
     authorized_origins,
+    is_active_test_authorized,
     is_authorized_origin,
     origin_of,
     resolve_target,
+    user_authorized_targets_enabled,
     validate_spec_url,
 )
 from .spec_fetch import SpecUnavailableError, acquire_spec, save_spec
+
+logger = logging.getLogger(__name__)
 
 # BOLA and BFLA share one request budget; both identity provisioning and
 # control executions count. 40 covers two check families against VAmPI.
@@ -50,6 +61,7 @@ def _require_assessment_stage_table() -> None:
             if inspect(connection).has_table("assessment_stages"):
                 return
     except Exception as exc:
+        logger.warning("Assessment database readiness check failed: %s", type(exc).__name__)
         raise AssessmentSchemaError(
             "Could not inspect the database schema. Verify PostgreSQL is "
             "reachable, then run: alembic upgrade head"
@@ -65,6 +77,76 @@ def _safe_reason(value):
     if value is None:
         return None
     return sanitize_text_for_persistence(str(value), max_length=1000)
+
+
+def _enum_value(value):
+    return getattr(value, "value", value)
+
+
+def _scan_findings(scan_id: int) -> list[dict]:
+    with get_session() as session:
+        findings = session.exec(
+            select(Finding)
+            .where(Finding.scan_id == scan_id)
+            .order_by(Finding.id)
+        ).all()
+        if not findings:
+            return []
+
+        endpoints = {
+            endpoint.id: endpoint
+            for endpoint in session.exec(
+                select(Endpoint).where(Endpoint.scan_id == scan_id)
+            ).all()
+        }
+        evidence_ids: dict[int, list[int]] = {}
+        for link in session.exec(
+            select(FindingEvidence).where(
+                FindingEvidence.finding_id.in_(
+                    [finding.id for finding in findings]
+                )
+            )
+        ).all():
+            evidence_ids.setdefault(link.finding_id, []).append(
+                link.execution_id
+            )
+
+        return [
+            {
+                "id": finding.id,
+                "scan_id": finding.scan_id,
+                "endpoint_id": finding.endpoint_id,
+                "finding_type": _enum_value(finding.finding_type),
+                "severity": _enum_value(finding.severity),
+                "description": (
+                    sanitize_text_for_persistence(
+                        finding.description, max_length=2000
+                    )
+                    or ""
+                ),
+                "status": _enum_value(finding.status),
+                "confidence": finding.confidence,
+                "method": (
+                    endpoints[finding.endpoint_id].method
+                    if finding.endpoint_id in endpoints
+                    else None
+                ),
+                "path": (
+                    endpoints[finding.endpoint_id].path
+                    if finding.endpoint_id in endpoints
+                    else None
+                ),
+                "operation_id": (
+                    endpoints[finding.endpoint_id].operation_id
+                    if finding.endpoint_id in endpoints
+                    else None
+                ),
+                "evidence_execution_ids": sorted(
+                    evidence_ids.get(finding.id, [])
+                ),
+            }
+            for finding in findings
+        ]
 
 
 def _update_scan(scan_id: int, status: ScanStatus, completed: bool = False) -> None:
@@ -95,42 +177,159 @@ def _persist_stage_outcomes(scan_id: int, stages: dict) -> None:
 
     Existing stage rows for the same scan are updated rather than deleted,
     so re-running an orchestration step does not discard earlier state.
+    A stage-persistence failure must not erase the scan itself; it is logged
+    and the caller decides the final lifecycle status.
     """
     now = datetime.now(timezone.utc)
+    try:
+        with get_session() as session:
+            existing = {
+                row.stage_name: row
+                for row in session.exec(
+                    select(AssessmentStage).where(
+                        AssessmentStage.scan_id == scan_id
+                    )
+                ).all()
+            }
+
+            for sequence, (stage_name, outcome) in enumerate(
+                stages.items(), start=1
+            ):
+                payload = dict(outcome)
+                status = str(payload.pop("status", "unknown"))[:64]
+                reason = payload.pop("reason", None)
+                details = _sanitize_stage_details(payload)
+
+                row = existing.get(stage_name)
+                if row is None:
+                    row = AssessmentStage(
+                        scan_id=scan_id,
+                        stage_name=stage_name,
+                        sequence=sequence,
+                        status=status,
+                        details=details,
+                        recorded_at=now,
+                    )
+                row.sequence = sequence
+                row.status = status
+                row.reason = sanitize_text_for_persistence(
+                    reason, max_length=1000
+                )
+                row.details = details
+                row.recorded_at = now
+                session.add(row)
+
+            session.commit()
+    except Exception as exc:  # noqa: BLE001 - lifecycle must still finalize
+        logger.error(
+            "Could not persist assessment stages for scan %s: %s",
+            scan_id,
+            type(exc).__name__,
+        )
+
+
+@dataclass(frozen=True)
+class ProvisionedAssessment:
+    """A validated target and scan row, before any target I/O."""
+
+    scan_id: int
+    target_id: int
+    base_url: str
+    origin: str
+    display_name: str
+    spec_url: str | None
+    resolved_target: ResolvedTarget
+
+
+def provision_assessment(
+    base_url: str,
+    openapi_spec_url: str | None = None,
+    target_name: str | None = None,
+) -> ProvisionedAssessment:
+    """Validate the target and create a pending scan.
+
+    Only local validation and one database insert happen here, so the API can
+    acknowledge a request quickly and run the slow stages in the background.
+    """
+    resolved_target = resolve_target(base_url)
+    base = resolved_target.base_url
+    origin = origin_of(base)
+    display_name = target_name or origin
+    spec_url = validate_spec_url(base, openapi_spec_url)
+
+    _require_assessment_stage_table()
+
     with get_session() as session:
-        existing = {
-            row.stage_name: row
-            for row in session.exec(
-                select(AssessmentStage).where(
-                    AssessmentStage.scan_id == scan_id
-                )
-            ).all()
-        }
-
-        for sequence, (stage_name, outcome) in enumerate(stages.items(), start=1):
-            payload = dict(outcome)
-            status = str(payload.pop("status", "unknown"))[:64]
-            reason = payload.pop("reason", None)
-            details = _sanitize_stage_details(payload)
-
-            row = existing.get(stage_name)
-            if row is None:
-                row = AssessmentStage(
-                    scan_id=scan_id,
-                    stage_name=stage_name,
-                    sequence=sequence,
-                    status=status,
-                    details=details,
-                    recorded_at=now,
-                )
-            row.sequence = sequence
-            row.status = status
-            row.reason = sanitize_text_for_persistence(reason, max_length=1000)
-            row.details = details
-            row.recorded_at = now
-            session.add(row)
-
+        target = Target(
+            name=display_name,
+            base_url=base,
+            openapi_spec_path="",
+        )
+        session.add(target)
         session.commit()
+        session.refresh(target)
+
+        scan = Scan(
+            target_id=target.id,
+            status=ScanStatus.PENDING,
+        )
+        session.add(scan)
+        session.commit()
+        session.refresh(scan)
+        target_id = target.id
+        scan_id = scan.id
+
+    return ProvisionedAssessment(
+        scan_id=scan_id,
+        target_id=target_id,
+        base_url=base,
+        origin=origin,
+        display_name=display_name,
+        spec_url=spec_url,
+        resolved_target=resolved_target,
+    )
+
+
+def _failure_result(
+    provisioned: ProvisionedAssessment,
+    message: str,
+    stages: dict | None = None,
+) -> dict:
+    """Persist an explicit failed outcome and return the public result shape."""
+    _persist_stage_outcomes(
+        provisioned.scan_id,
+        stages
+        or {
+            "target_validation": {
+                "status": "passed",
+                "base_url": provisioned.base_url,
+                "origin": provisioned.origin,
+            },
+            "lifecycle": {
+                "status": "failed",
+                "reason": message,
+            },
+        },
+    )
+    _update_scan(provisioned.scan_id, ScanStatus.FAILED, completed=True)
+    return {
+        "scan_id": provisioned.scan_id,
+        "target_id": provisioned.target_id,
+        "target": {
+            "id": provisioned.target_id,
+            "name": provisioned.display_name,
+            "base_url": provisioned.base_url,
+        },
+        "base_url": provisioned.base_url,
+        "origin": provisioned.origin,
+        "spec_source": None,
+        "status": ScanStatus.FAILED.value,
+        "findings_count": 0,
+        "findings": [],
+        "findings_persisted": 0,
+        "stages": stages or {},
+    }
+
 
 
 def _classification_summary(recon: ReconResult, requested: bool) -> dict:
@@ -223,27 +422,152 @@ def _resource_graph_summary(scan_id: int) -> dict:
     }
 
 
+_IDENTITY_CONTRACT_PATHS = frozenset(
+    {
+        ("POST", "/users/v1/register"),
+        ("POST", "/users/v1/login"),
+    }
+)
+
+
+def _endpoint_path_relative_to_base(path: str, base_path: str) -> str:
+    normalized = "/" + str(path or "").strip("/")
+    if base_path == "/":
+        return normalized
+    prefix = base_path.rstrip("/")
+    if normalized == prefix or normalized.startswith(prefix + "/"):
+        relative = normalized[len(prefix):]
+        return relative or "/"
+    return normalized
+
+
+def _identity_contract_supported(scan_id: int, base_url: str) -> bool:
+    """Return whether the spec exposes the supported identity contract.
+
+    Active checks must not guess registration/login paths for a target with
+    a different authentication mechanism. The supported contract is the
+    VAmPI-compatible register/login pair used by ``AuthModule``.
+    """
+    base_path = "/" + urlsplit(base_url).path.strip("/")
+    try:
+        with get_session() as session:
+            rows = session.exec(
+                select(Endpoint.method, Endpoint.path).where(
+                    Endpoint.scan_id == scan_id
+                )
+            ).all()
+    except Exception:  # noqa: BLE001 - report unsupported rather than guess
+        return False
+
+    available = {
+        (
+            str(method or "").upper(),
+            _endpoint_path_relative_to_base(path, base_path),
+        )
+        for method, path in rows
+    }
+    return _IDENTITY_CONTRACT_PATHS <= available
+
+
 def _authorization_summary(
     scan_id: int,
     origin: str,
     allow_identity_registration: bool,
     budget: int,
     resolved_target=None,
+    identity_contract_supported: bool = True,
+    auth_profile: AuthProfile | None = None,
+    authorized_for_active_testing: bool = False,
 ):
-    if not is_authorized_origin(origin):
+    active_authorized = is_authorized_origin(origin) or is_active_test_authorized(
+        origin,
+        authorized_for_active_testing=authorized_for_active_testing,
+    )
+    profile_supported = auth_profile is not None
+    if not active_authorized:
+        if user_authorized_targets_enabled() and not authorized_for_active_testing:
+            reason = (
+                "Active testing requires authorized_for_active_testing=true "
+                "for this assessment, or an explicitly allowlisted origin "
+                f"{sorted(authorized_origins())}."
+            )
+        else:
+            reason = (
+                "Authorization checks are only enabled for explicitly "
+                f"allowlisted origins {sorted(authorized_origins())}, or for "
+                "user-authorized targets when the operator enables "
+                "APIVIGILANTE_ALLOW_USER_AUTHORIZED_TARGETS. This target's "
+                "endpoints were still discovered and persisted."
+            )
         return {
             "status": "not_supported",
             "supported_for_target": False,
+            "identity_contract_supported": identity_contract_supported,
+            "auth_profile_supported": profile_supported,
+            "reason": reason,
+        }
+    if profile_supported:
+        if auth_profile.type == "none":
+            return {
+                "status": "not_applicable",
+                "supported_for_target": True,
+                "identity_contract_supported": False,
+                "auth_profile_supported": True,
+                "auth_profile_type": auth_profile.type,
+                "auth_scheme": auth_profile.scheme,
+                "reason": (
+                    "The auth profile is anonymous; no authenticated BOLA "
+                    "check is possible. Sensitive-data inspection may still run."
+                ),
+            }
+        if not allow_identity_registration:
+            return {
+                "status": "not_run",
+                "supported_for_target": True,
+                "identity_contract_supported": False,
+                "auth_profile_supported": True,
+                "auth_profile_type": auth_profile.type,
+                "auth_scheme": auth_profile.scheme,
+                "reason": (
+                    "Active testing was not approved. Re-run with "
+                    "allow_identity_registration=true to execute profile-based "
+                    "read-only BOLA checks."
+                ),
+            }
+        if len(auth_profile.identities) < 2:
+            return {
+                "status": "not_applicable",
+                "supported_for_target": True,
+                "identity_contract_supported": False,
+                "auth_profile_supported": True,
+                "auth_profile_type": auth_profile.type,
+                "auth_scheme": auth_profile.scheme,
+                "reason": (
+                    "Read-only BOLA requires at least two identities in the "
+                    "auth profile (attacker and victim)."
+                ),
+            }
+    elif not identity_contract_supported:
+        return {
+            "status": "unsupported",
+            "supported_for_target": False,
+            "identity_contract_supported": False,
+            "auth_profile_supported": False,
             "reason": (
-                "Authorization checks are only enabled for explicitly "
-                f"allowlisted origins {sorted(authorized_origins())}. "
-                "This target's endpoints were still discovered and persisted."
+                "This target does not expose the supported identity contract "
+                "(POST /users/v1/register and POST /users/v1/login) and no "
+                "auth_profile was supplied. Authorization checks were skipped "
+                "rather than guessing a different authentication mechanism."
             ),
         }
     if not allow_identity_registration:
         return {
             "status": "not_run",
             "supported_for_target": True,
+            "identity_contract_supported": identity_contract_supported,
+            "auth_profile_supported": profile_supported,
+            "auth_profile_type": auth_profile.type if auth_profile else None,
+            "auth_scheme": auth_profile.scheme if auth_profile else None,
             "reason": (
                 "Identity registration was not approved. Re-run with "
                 "allow_identity_registration=true to execute BOLA and BFLA checks."
@@ -256,11 +580,17 @@ def _authorization_summary(
             allow_identity_registration=True,
             request_budget=budget,
             resolved_target=resolved_target,
+            auth_profile=auth_profile,
+            authorized_for_active_testing=authorized_for_active_testing,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced in the response
         return {
             "status": "failed",
             "supported_for_target": True,
+            "identity_contract_supported": identity_contract_supported,
+            "auth_profile_supported": profile_supported,
+            "auth_profile_type": auth_profile.type if auth_profile else None,
+            "auth_scheme": auth_profile.scheme if auth_profile else None,
             "reason": _safe_reason(
                 f"Authorization checks failed: {type(exc).__name__}: {exc}"
             ),
@@ -276,7 +606,7 @@ def _authorization_summary(
         status = "partial"
     elif bola_ran or bfla_ran:
         status = "performed"
-    elif result.bfla_status == "unsupported":
+    elif result.bfla_status == "unsupported" and not profile_supported:
         status = "unsupported"
     else:
         status = "not_applicable"
@@ -299,8 +629,14 @@ def _authorization_summary(
             skipped_reasons[0]
             if skipped_reasons
             else (
-                "No eligible BOLA or BFLA candidate was found for this "
-                "target; no authorization check ran."
+                result.bfla_reason
+                if result.bfla_status == "not_applicable"
+                and result.bfla_reason
+                and not result.endpoint_results
+                else (
+                    "No eligible BOLA or BFLA candidate was found for this "
+                    "target; no authorization check ran."
+                )
             )
         )
     else:
@@ -318,6 +654,10 @@ def _authorization_summary(
     return {
         "status": status,
         "supported_for_target": True,
+        "identity_contract_supported": identity_contract_supported,
+        "auth_profile_supported": profile_supported,
+        "auth_profile_type": auth_profile.type if auth_profile else None,
+        "auth_scheme": auth_profile.scheme if auth_profile else None,
         "reason": _safe_reason(reason),
         "bola_status": bola_status,
         "requests_used": result.requests_used,
@@ -359,20 +699,44 @@ def _sensitive_summary(
     allow_identity_registration: bool,
     budget: int,
     resolved_target=None,
+    identity_contract_supported: bool = True,
+    auth_profile: AuthProfile | None = None,
+    authorized_for_active_testing: bool = False,
 ):
-    if not is_authorized_origin(origin):
+    active_authorized = is_authorized_origin(origin) or is_active_test_authorized(
+        origin,
+        authorized_for_active_testing=authorized_for_active_testing,
+    )
+    profile_supported = auth_profile is not None
+    if not active_authorized:
+        if user_authorized_targets_enabled() and not authorized_for_active_testing:
+            reason = (
+                "Active testing requires authorized_for_active_testing=true "
+                "for this assessment, or an explicitly allowlisted origin "
+                f"{sorted(authorized_origins())}."
+            )
+        else:
+            reason = (
+                "Sensitive-data checks are only enabled for explicitly "
+                f"allowlisted origins {sorted(authorized_origins())}, or for "
+                "user-authorized targets when the operator enables "
+                "APIVIGILANTE_ALLOW_USER_AUTHORIZED_TARGETS."
+            )
         return {
             "status": "not_supported",
             "supported_for_target": False,
-            "reason": (
-                "Sensitive-data checks are only enabled for explicitly "
-                f"allowlisted origins {sorted(authorized_origins())}."
-            ),
+            "identity_contract_supported": identity_contract_supported,
+            "auth_profile_supported": profile_supported,
+            "reason": reason,
         }
     if not allow_identity_registration:
         return {
             "status": "not_run",
             "supported_for_target": True,
+            "identity_contract_supported": identity_contract_supported,
+            "auth_profile_supported": profile_supported,
+            "auth_profile_type": auth_profile.type if auth_profile else None,
+            "auth_scheme": auth_profile.scheme if auth_profile else None,
             "reason": (
                 "Active testing was not approved. Re-run with "
                 "allow_identity_registration=true to inspect response bodies."
@@ -385,11 +749,20 @@ def _sensitive_summary(
             allow_identity_registration=True,
             request_budget=min(budget, DEFAULT_SENSITIVE_REQUEST_BUDGET),
             resolved_target=resolved_target,
+            provision_identity_enabled=(
+                identity_contract_supported and auth_profile is None
+            ),
+            auth_profile=auth_profile,
+            authorized_for_active_testing=authorized_for_active_testing,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced in the response
         return {
             "status": "failed",
             "supported_for_target": True,
+            "identity_contract_supported": identity_contract_supported,
+            "auth_profile_supported": profile_supported,
+            "auth_profile_type": auth_profile.type if auth_profile else None,
+            "auth_scheme": auth_profile.scheme if auth_profile else None,
             "reason": _safe_reason(
                 f"Sensitive-data checks failed: {type(exc).__name__}: {exc}"
             ),
@@ -398,6 +771,10 @@ def _sensitive_summary(
     return {
         "status": result.status,
         "supported_for_target": True,
+        "identity_contract_supported": identity_contract_supported,
+        "auth_profile_supported": profile_supported,
+        "auth_profile_type": auth_profile.type if auth_profile else None,
+        "auth_scheme": auth_profile.scheme if auth_profile else None,
         "requests_used": result.requests_used,
         "request_budget": result.request_budget,
         "reason": _safe_reason(result.reason),
@@ -421,27 +798,7 @@ def _sensitive_summary(
     }
 
 
-def create_assessment(
-    base_url: str,
-    openapi_spec_url: str | None = None,
-    target_name: str | None = None,
-    allow_identity_registration: bool = False,
-    classify: bool = True,
-    request_budget: int = DEFAULT_ASSESSMENT_REQUEST_BUDGET,
-) -> dict:
-    """Create a Target + Scan and run the assessment stages in order.
-
-    Stage order: target validation -> spec discovery -> recon (endpoint
-    inventory) -> optional LLM classification -> resource graph ->
-    BOLA/BFLA -> sensitive data. Each stage outcome is returned explicitly;
-    non-foundational stage failures are reported without discarding earlier
-    results. Persistence and report availability are reported last.
-
-    Raises TargetValidationError for unsafe URLs and SpecUnavailableError
-    when no usable OpenAPI document can be obtained. In both cases no
-    Target or Scan is created. A Recon/spec-parse failure marks the created
-    scan as failed and is re-raised.
-    """
+def _validate_request_budget(request_budget: int) -> None:
     if (
         isinstance(request_budget, bool)
         or not isinstance(request_budget, int)
@@ -449,99 +806,284 @@ def create_assessment(
     ):
         raise ValueError("request budget must be a non-negative integer.")
 
-    resolved_target = resolve_target(base_url)
-    base = resolved_target.base_url
-    origin = origin_of(base)
-    spec_url = validate_spec_url(base, openapi_spec_url)
 
-    _require_assessment_stage_table()
+def create_assessment(
+    base_url: str,
+    openapi_spec_url: str | None = None,
+    target_name: str | None = None,
+    allow_identity_registration: bool = False,
+    classify: bool = True,
+    request_budget: int = DEFAULT_ASSESSMENT_REQUEST_BUDGET,
+    auth_profile: AuthProfile | None = None,
+    authorized_for_active_testing: bool = False,
+) -> dict:
+    """Validate a target, create the scan, and run every stage synchronously.
 
-    spec = acquire_spec(
-        base,
-        spec_url,
-        resolved_target=resolved_target,
+    This is the deterministic entry point used by tests and by callers that
+    need the completed result. The HTTP API uses ``provision_assessment`` plus
+    ``run_assessment`` so slow target I/O does not block the request.
+    """
+    _validate_request_budget(request_budget)
+    provisioned = provision_assessment(
+        base_url=base_url,
+        openapi_spec_url=openapi_spec_url,
+        target_name=target_name,
     )
+    return run_assessment(
+        provisioned,
+        allow_identity_registration=allow_identity_registration,
+        classify=classify,
+        request_budget=request_budget,
+        auth_profile=auth_profile,
+        authorized_for_active_testing=authorized_for_active_testing,
+    )
+
+
+def _begin_scan(scan_id: int) -> None:
+    """Move a provisioned scan into the running state.
+
+    Reading the row first keeps this idempotent and avoids an extra status
+    write when a caller re-runs an already-running scan.
+    """
+    try:
+        with get_session() as session:
+            scan = session.get(Scan, scan_id)
+            if scan is None or scan.status == ScanStatus.RUNNING:
+                return
+            scan.status = ScanStatus.RUNNING
+            if scan.started_at is None:
+                scan.started_at = datetime.now(timezone.utc)
+            session.add(scan)
+            session.commit()
+    except Exception as exc:  # noqa: BLE001 - the guarded body handles it
+        logger.error(
+            "Could not mark scan %s as running: %s",
+            scan_id,
+            type(exc).__name__,
+        )
+
+
+def run_assessment(
+    provisioned: ProvisionedAssessment,
+    *,
+    allow_identity_registration: bool = False,
+    classify: bool = True,
+    request_budget: int = DEFAULT_ASSESSMENT_REQUEST_BUDGET,
+    auth_profile: AuthProfile | None = None,
+    authorized_for_active_testing: bool = False,
+) -> dict:
+    """Run all assessment stages for an already-provisioned scan.
+
+    The scan is transitioned to ``running`` first. Any unexpected error is
+    converted into a persisted failed outcome, so a scan can never remain
+    ``running`` because a stage or persistence helper raised.
+    """
+    _validate_request_budget(request_budget)
+    _begin_scan(provisioned.scan_id)
+    try:
+        return _execute_assessment(
+            provisioned,
+            allow_identity_registration=allow_identity_registration,
+            classify=classify,
+            request_budget=request_budget,
+            auth_profile=auth_profile,
+            authorized_for_active_testing=authorized_for_active_testing,
+        )
+    except Exception as exc:  # noqa: BLE001 - persisted, never left running
+        logger.error(
+            "Assessment %s failed unexpectedly: %s",
+            provisioned.scan_id,
+            type(exc).__name__,
+        )
+        message = _safe_reason(
+            f"The assessment stopped unexpectedly ({type(exc).__name__}). "
+            "Any results persisted before the failure are retained."
+        )
+        return _failure_result(provisioned, message or "Assessment failed.")
+
+
+def _execute_assessment(
+    provisioned: ProvisionedAssessment,
+    *,
+    allow_identity_registration: bool,
+    classify: bool,
+    request_budget: int,
+    auth_profile: AuthProfile | None,
+    authorized_for_active_testing: bool,
+) -> dict:
+    """Run the stage pipeline for a provisioned scan.
+
+    Stage order: spec discovery -> recon (endpoint inventory) -> optional LLM
+    classification -> resource graph -> BOLA/BFLA -> sensitive data. Each
+    stage outcome is returned explicitly; non-foundational stage failures are
+    reported without discarding earlier results.
+    """
+    base = provisioned.base_url
+    origin = provisioned.origin
+    target_display_name = provisioned.display_name
+    spec_url = provisioned.spec_url
+    resolved_target = provisioned.resolved_target
+    scan_id = provisioned.scan_id
+    target_id = provisioned.target_id
+
+    try:
+        spec = acquire_spec(
+            base,
+            spec_url,
+            resolved_target=resolved_target,
+        )
+    except SpecUnavailableError as exc:
+        failed_reason = _safe_reason(str(exc)) or "No usable specification or discoverable routes were found."
+        stages = {
+            "target_validation": {
+                "status": "passed",
+                "base_url": base,
+                "origin": origin,
+            },
+            "spec_discovery": {
+                "status": "failed",
+                "source": "openapi",
+                "reason": failed_reason,
+            },
+            "recon": {
+                "status": "not_run",
+                "endpoints": 0,
+                "reason": "Specification acquisition did not produce an inventory.",
+            },
+            "classification": {
+                "status": "not_run",
+                "reason": "No endpoints were available to classify.",
+            },
+            "resource_graph": {
+                "status": "not_run",
+                "reason": "No endpoints were available to build a resource graph.",
+            },
+            "authorization_checks": {
+                "status": "not_run",
+                "reason": "No endpoints were available for authorization checks.",
+            },
+            "sensitive_data_checks": {
+                "status": "not_run",
+                "reason": "No endpoints were available for sensitive-data checks.",
+            },
+            "persistence": {
+                "status": "completed",
+                "findings_persisted": 0,
+            },
+            "report": {
+                "status": "available",
+                "path": f"/scans/{scan_id}/report",
+            },
+        }
+        _persist_stage_outcomes(scan_id, stages)
+        _update_scan(scan_id, ScanStatus.FAILED, completed=True)
+        return {
+            "scan_id": scan_id,
+            "target_id": target_id,
+            "target": {
+                "id": target_id,
+                "name": target_display_name,
+                "base_url": base,
+            },
+            "base_url": base,
+            "origin": origin,
+            "spec_source": None,
+            "status": ScanStatus.FAILED.value,
+            "findings_count": 0,
+            "findings": [],
+            "findings_persisted": 0,
+            "stages": stages,
+        }
+
     spec_path = save_spec(spec)
-
     with get_session() as session:
-        target = Target(
-            name=target_name or origin,
-            base_url=base,
-            openapi_spec_path=spec_path,
-        )
-        session.add(target)
+        persisted_target = session.get(Target, target_id)
+        if persisted_target is None:
+            raise AssessmentSchemaError(
+                "The assessment target disappeared before its specification could be saved."
+            )
+        persisted_target.openapi_spec_path = spec_path
+        session.add(persisted_target)
         session.commit()
-        session.refresh(target)
-
-        scan = Scan(
-            target_id=target.id,
-            status=ScanStatus.RUNNING,
-            started_at=datetime.now(timezone.utc),
-        )
-        session.add(scan)
-        session.commit()
-        session.refresh(scan)
-        scan_id = scan.id
-        target_id = target.id
 
     try:
         recon = run_recon(scan_id, classify=classify)
     except Exception as exc:  # noqa: BLE001 - scan is marked failed and persisted
-        failed_reason = (
+        failed_reason = _safe_reason(
             f"Reconnaissance failed: {type(exc).__name__}: {exc}"
-        )
+        ) or "Reconnaissance failed."
+        stages = {
+            "target_validation": {
+                "status": "passed",
+                "base_url": base,
+                "origin": origin,
+            },
+            "spec_discovery": {
+                "status": "discovery_only" if spec.discovery_mode else "succeeded",
+                "source_type": (
+                    "bounded_html_discovery" if spec.discovery_mode else "openapi"
+                ),
+                "source": spec.source_url,
+                "path": spec_path,
+                "limitations": spec.limitations,
+            },
+            "recon": {
+                "status": "failed",
+                "reason": failed_reason,
+                "endpoints": 0,
+            },
+            "classification": {
+                "status": "not_run",
+                "reason": "Reconnaissance did not complete.",
+            },
+            "resource_graph": {
+                "status": "not_run",
+                "reason": "Reconnaissance did not complete.",
+            },
+            "authorization_checks": {
+                "status": "not_run",
+                "reason": "Reconnaissance did not complete.",
+            },
+            "sensitive_data_checks": {
+                "status": "not_run",
+                "reason": "Reconnaissance did not complete.",
+            },
+            "persistence": {
+                "status": "completed",
+                "findings_persisted": 0,
+            },
+            "report": {
+                "status": "available",
+                "path": f"/scans/{scan_id}/report",
+            },
+        }
         try:
-            _persist_stage_outcomes(
-                scan_id,
-                {
-                    "target_validation": {
-                        "status": "passed",
-                        "base_url": base,
-                        "origin": origin,
-                    },
-                    "spec_discovery": {
-                        "status": "succeeded",
-                        "source": spec.source_url,
-                        "path": spec_path,
-                    },
-                    "recon": {
-                        "status": "failed",
-                        "reason": failed_reason,
-                        "endpoints": 0,
-                    },
-                    "classification": {
-                        "status": "not_run",
-                        "reason": "Reconnaissance did not complete.",
-                    },
-                    "resource_graph": {
-                        "status": "not_run",
-                        "reason": "Reconnaissance did not complete.",
-                    },
-                    "authorization_checks": {
-                        "status": "not_run",
-                        "reason": "Reconnaissance did not complete.",
-                    },
-                    "sensitive_data_checks": {
-                        "status": "not_run",
-                        "reason": "Reconnaissance did not complete.",
-                    },
-                    "persistence": {
-                        "status": "not_run",
-                        "reason": "Assessment did not reach persistence.",
-                    },
-                    "report": {
-                        "status": "available",
-                        "path": f"/scans/{scan_id}/report",
-                    },
-                },
-            )
+            _persist_stage_outcomes(scan_id, stages)
         except Exception:  # noqa: BLE001 - preserve the primary recon error
             pass
         _update_scan(scan_id, ScanStatus.FAILED, completed=True)
-        raise
+        return {
+            "scan_id": scan_id,
+            "target_id": target_id,
+            "target": {
+                "id": target_id,
+                "name": target_display_name,
+                "base_url": base,
+            },
+            "base_url": base,
+            "origin": origin,
+            "spec_source": spec.source_url,
+            "status": ScanStatus.FAILED.value,
+            "findings_count": 0,
+            "findings": [],
+            "findings_persisted": 0,
+            "recon": {"status": "failed", "endpoints_found": 0},
+            "stages": stages,
+        }
 
     classification = _classification_summary(recon, classify)
     resource_graph = _resource_graph_summary(scan_id)
+    identity_contract_supported = _identity_contract_supported(scan_id, base)
 
     authorization = _authorization_summary(
         scan_id,
@@ -549,6 +1091,9 @@ def create_assessment(
         allow_identity_registration,
         request_budget,
         resolved_target=resolved_target,
+        identity_contract_supported=identity_contract_supported,
+        auth_profile=auth_profile,
+        authorized_for_active_testing=authorized_for_active_testing,
     )
     # Authorization and sensitive-data checks share the assessment's one
     # approved budget. Sensitive inspection gets only what remains, capped
@@ -561,16 +1106,21 @@ def create_assessment(
         allow_identity_registration,
         remaining_budget,
         resolved_target=resolved_target,
+        identity_contract_supported=identity_contract_supported,
+        auth_profile=auth_profile,
+        authorized_for_active_testing=authorized_for_active_testing,
     )
 
-    with get_session() as session:
-        findings_persisted = len(
-            session.exec(
-                select(Finding.id).where(Finding.scan_id == scan_id)
-            ).all()
-        )
+    findings = _scan_findings(scan_id)
+    findings_persisted = len(findings)
 
     recon_status = "completed" if recon.endpoints_found else "no_endpoints"
+    if spec.discovery_mode:
+        recon.coverage.limitations.extend(
+            limitation
+            for limitation in spec.limitations
+            if limitation not in recon.coverage.limitations
+        )
 
     stages = {
         "target_validation": {
@@ -579,9 +1129,13 @@ def create_assessment(
             "origin": origin,
         },
         "spec_discovery": {
-            "status": "succeeded",
+            "status": "discovery_only" if spec.discovery_mode else "succeeded",
+            "source_type": (
+                "bounded_html_discovery" if spec.discovery_mode else "openapi"
+            ),
             "source": spec.source_url,
             "path": spec_path,
+            "limitations": spec.limitations,
             "format": recon.coverage.spec_format,
             "version": recon.coverage.spec_version,
         },
@@ -613,6 +1167,14 @@ def create_assessment(
             "status": authorization["status"],
             "reason": authorization.get("reason"),
             "supported_for_target": authorization.get("supported_for_target"),
+            "identity_contract_supported": authorization.get(
+                "identity_contract_supported"
+            ),
+            "auth_profile_supported": authorization.get(
+                "auth_profile_supported"
+            ),
+            "auth_profile_type": authorization.get("auth_profile_type"),
+            "auth_scheme": authorization.get("auth_scheme"),
             "bola_status": authorization.get("bola_status"),
             "bfla_status": authorization.get("bfla_status"),
             "bfla_reason": authorization.get("bfla_reason"),
@@ -631,6 +1193,14 @@ def create_assessment(
             "status": sensitive_data["status"],
             "reason": sensitive_data.get("reason"),
             "supported_for_target": sensitive_data.get("supported_for_target"),
+            "identity_contract_supported": sensitive_data.get(
+                "identity_contract_supported"
+            ),
+            "auth_profile_supported": sensitive_data.get(
+                "auth_profile_supported"
+            ),
+            "auth_profile_type": sensitive_data.get("auth_profile_type"),
+            "auth_scheme": sensitive_data.get("auth_scheme"),
             "requests_used": sensitive_data.get("requests_used"),
             "request_budget": sensitive_data.get("request_budget"),
             "confirmed_findings": sensitive_data.get("confirmed_findings"),
@@ -648,16 +1218,41 @@ def create_assessment(
     }
 
     _persist_stage_outcomes(scan_id, stages)
-    _update_scan(scan_id, ScanStatus.COMPLETED, completed=True)
+
+    # A scan that produced an inventory is COMPLETED only when no security
+    # stage failed. PARTIAL makes a degraded assessment distinguishable from
+    # a clean one instead of reporting a misleading success.
+    degraded_stages = [
+        name
+        for name in (
+            "recon",
+            "resource_graph",
+            "authorization_checks",
+            "sensitive_data_checks",
+        )
+        if stages.get(name, {}).get("status") == "failed"
+    ]
+    if recon.endpoints_found == 0:
+        final_status = ScanStatus.FAILED
+    elif degraded_stages:
+        final_status = ScanStatus.PARTIAL
+    else:
+        final_status = ScanStatus.COMPLETED
+    _update_scan(scan_id, final_status, completed=True)
 
     return {
         "scan_id": scan_id,
         "target_id": target_id,
+        "target": {
+            "id": target_id,
+            "name": target_display_name,
+            "base_url": base,
+        },
         "base_url": base,
         "origin": origin,
         "spec_source": spec.source_url,
         "spec_path": spec_path,
-        "status": ScanStatus.COMPLETED.value,
+        "status": final_status.value,
         "recon": {
             "status": recon_status,
             "endpoints_found": recon.endpoints_found,
@@ -669,6 +1264,8 @@ def create_assessment(
         "resource_graph": resource_graph,
         "authorization_tests": authorization,
         "sensitive_data_tests": sensitive_data,
+        "findings_count": findings_persisted,
+        "findings": findings,
         "findings_persisted": findings_persisted,
         "stages": stages,
     }

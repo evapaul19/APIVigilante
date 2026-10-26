@@ -82,3 +82,12 @@ def test_authenticated_user_can_read_another_users_profile():
 def test_profile_requires_authentication():
     response = client.get("/users/v1/alice/profile")
     assert response.status_code in (401, 403)
+
+
+def test_custom_openapi_path_is_available():
+    response = client.get("/metadata/openapi.json")
+
+    assert response.status_code == 200
+    document = response.json()
+    assert document["openapi"].startswith("3.")
+    assert "/users/v1/{username}/profile" in document["paths"]

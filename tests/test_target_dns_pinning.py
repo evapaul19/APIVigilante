@@ -23,6 +23,7 @@ from api_security_system.targets.security import (
     DEFAULT_AUTHORIZED_ORIGIN,
     TEST_ONLY_AUTHORIZED_ORIGIN,
     TEST_ONLY_ORIGIN_ENV,
+    TEST_ONLY_ORIGINS_ENV,
     ResolvedTarget,
     TargetValidationError,
     resolve_target,
@@ -255,6 +256,50 @@ def test_authorized_origin_resolves_only_when_connecting(monkeypatch):
     assert validate_target_url(TEST_ONLY_AUTHORIZED_ORIGIN) == (
         TEST_ONLY_AUTHORIZED_ORIGIN
     )
+
+
+def test_configured_test_origin_with_custom_port_resolves(monkeypatch):
+    monkeypatch.setenv(TEST_ONLY_ORIGIN_ENV, "1")
+    monkeypatch.setenv(TEST_ONLY_ORIGINS_ENV, "http://127.0.0.1:8888")
+    _patch_resolution(monkeypatch, "127.0.0.1")
+
+    resolved = resolve_target("http://127.0.0.1:8888/api/v2")
+
+    assert resolved.base_url == "http://127.0.0.1:8888/api/v2"
+    assert resolved.addresses == ("127.0.0.1",)
+
+
+def test_configured_ipv6_test_origin_resolves_loopback(monkeypatch):
+    monkeypatch.setenv(TEST_ONLY_ORIGIN_ENV, "1")
+    monkeypatch.setenv(TEST_ONLY_ORIGINS_ENV, "http://[::1]:8888")
+    _patch_resolution(monkeypatch, "::1")
+
+    resolved = resolve_target("http://[::1]:8888")
+
+    assert resolved.base_url == "http://[::1]:8888"
+    assert resolved.addresses == ("::1",)
+
+
+def test_public_user_defined_target_resolves_without_allowlist(monkeypatch):
+    _patch_resolution(monkeypatch, PUBLIC_V4)
+
+    resolved = resolve_target("https://api.example.com/v1")
+
+    assert resolved.base_url == "https://api.example.com/v1"
+    assert resolved.addresses == (PUBLIC_V4,)
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fe80::1"],
+)
+def test_public_hostname_resolving_to_prohibited_address_is_rejected(
+    monkeypatch, address
+):
+    _patch_resolution(monkeypatch, address)
+
+    with pytest.raises(TargetValidationError):
+        resolve_target("https://public.example")
 
 
 def test_validation_only_does_not_resolve_authorized_hostname(monkeypatch):
@@ -891,6 +936,26 @@ def test_acquire_spec_resolves_once_when_addresses_not_supplied(monkeypatch):
 
     assert calls == [
         ("https://public.example/openapi.json", (PUBLIC_V4,))
+    ]
+
+
+def test_acquire_spec_treats_explicit_default_port_as_same_origin(monkeypatch):
+    calls = []
+
+    def fake_fetch(url, resolved_addresses):
+        calls.append((url, resolved_addresses))
+        return b'{"openapi": "3.0.0", "paths": {}}'
+
+    monkeypatch.setattr(spec_fetch, "_fetch", fake_fetch)
+
+    spec_fetch.acquire_spec(
+        "http://public.example",
+        "http://public.example:80/openapi.json",
+        resolved_addresses=(PUBLIC_V4,),
+    )
+
+    assert calls == [
+        ("http://public.example:80/openapi.json", (PUBLIC_V4,))
     ]
 
 

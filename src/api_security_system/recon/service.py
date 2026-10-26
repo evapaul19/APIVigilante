@@ -2,7 +2,7 @@
 
 Accepts an existing scan_id - does not create Target/Scan records.
 
-OpenAPI spec paths stored as relative (e.g. "targets/vampi-openapi.yml")
+OpenAPI spec paths stored as relative (e.g. "targets/fetched-*.yaml")
 are resolved against the project root so they work from any CWD.
 """
 
@@ -16,7 +16,7 @@ from api_security_system.db import Endpoint, Scan, Target, get_session
 from api_security_system.llm import LLMClient
 
 # Resolve OpenAPI spec paths relative to project root so they work
-# from any CWD (the target stores a relative path like "targets/vampi-openapi.yml")
+# from any CWD (the target stores a relative path like "targets/fetched-*.yaml")
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent  # .../api-security-system
 
 from .classifier import ClassificationError, classify_endpoint
@@ -171,7 +171,7 @@ def run_recon(
 
         target = session.get(Target, scan.target_id)
         # Resolve openapi_spec_path relative to project root so it works
-        # from any CWD (the target stores a relative path like "targets/vampi-openapi.yml")
+        # from any CWD (the target stores a relative path like "targets/fetched-*.yaml")
         spec_path = Path(target.openapi_spec_path)
         if not spec_path.is_absolute():
             spec_path = _PROJECT_ROOT / spec_path

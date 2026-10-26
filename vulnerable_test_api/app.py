@@ -141,6 +141,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metadata/openapi.json", include_in_schema=False)
+def custom_openapi_path() -> dict:
+    """Serve the same document at a non-default discovery path."""
+    return app.openapi()
+
+
 @app.post(
     "/users/v1/register",
     response_model=MessageResponse,

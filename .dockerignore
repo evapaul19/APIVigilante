@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+.env
+.env.*
+!.env.example
+__pycache__
+*.py[cod]
+.pytest_cache
+tests
+targets/fetched-*
+frontend
+vulnerable_test_api
+submission-output
+*.bak

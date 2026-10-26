@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from logging.config import fileConfig
 
@@ -13,8 +14,19 @@ from alembic import context
 # access to the values within the .ini file in use.
 config = context.config
 
-load_dotenv()
-config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
+# Resolve .env from the project root, not the current working directory, so
+# `alembic` works from any shell directory. An explicitly exported
+# DATABASE_URL always wins over the file.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=_PROJECT_ROOT / ".env")
+
+_database_url = os.environ.get("DATABASE_URL")
+if not _database_url:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Add it to the project-root .env file or "
+        "export it before running Alembic."
+    )
+config.set_main_option("sqlalchemy.url", _database_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -68,6 +80,11 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=(
+            {"connect_timeout": 5}
+            if _database_url.startswith("postgresql")
+            else {}
+        ),
     )
 
     with connectable.connect() as connection:

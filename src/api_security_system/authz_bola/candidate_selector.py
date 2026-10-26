@@ -86,6 +86,53 @@ def select_bola_candidates(scan_id: int, resource_type: str = "user") -> list[Bo
     return candidates
 
 
+def select_read_candidates(scan_id: int) -> list[BolaCandidate]:
+    """Select authenticated GET endpoints with at least one path parameter.
+
+    Unlike ``select_bola_candidates`` this does not depend on the resource
+    graph's ``IDENTIFIES`` edge. It is intended for caller-supplied auth
+    profiles that provide a concrete value for every path parameter for
+    each identity. The caller remains responsible for supplying identifiers
+    that actually belong to those identities.
+    """
+    with get_session() as session:
+        rows = session.exec(
+            select(Endpoint).where(Endpoint.scan_id == scan_id)
+        ).all()
+
+    candidates: list[BolaCandidate] = []
+    for row in rows:
+        if str(row.method or "").upper() != "GET":
+            continue
+        fragment = row.raw_spec_fragment or {}
+        if not fragment.get("security"):
+            continue
+        parameters = _PATH_TEMPLATE_PARAMETER.findall(str(row.path or ""))
+        if not parameters:
+            continue
+        candidates.append(
+            BolaCandidate(
+                endpoint_id=row.id,
+                method=row.method,
+                path=row.path,
+                operation_id=row.operation_id,
+                id_param_name=parameters[0],
+                path_params=parameters,
+                summary=(
+                    str(fragment.get("summary"))
+                    if fragment.get("summary") is not None
+                    else None
+                ),
+                description=(
+                    str(fragment.get("description"))
+                    if fragment.get("description") is not None
+                    else None
+                ),
+            )
+        )
+    return sorted(candidates, key=lambda item: (item.path, item.operation_id or ""))
+
+
 def is_read_candidate(candidate: BolaCandidate) -> bool:
     """A read-only BOLA candidate: a GET with exactly one substitutable
     path identifier. Reads never mutate the target, so they can be

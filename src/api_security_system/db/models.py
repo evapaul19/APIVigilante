@@ -31,7 +31,7 @@ class Scan(SQLModel, table=True):
     __tablename__ = "scans"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending','running','completed','failed')",
+            "status IN ('pending','running','completed','partial','failed')",
             name="ck_scans_status",
         ),
     )

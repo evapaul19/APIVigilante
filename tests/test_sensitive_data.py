@@ -9,6 +9,7 @@ from api_security_system.sensitive_data.patterns import (
 )
 from api_security_system.sensitive_data.schemas import SensitiveOutcome
 from api_security_system.sensitive_data.service import (
+    _resolve_path,
     _sanitize_for_persistence,
     inspect_body,
 )
@@ -204,3 +205,23 @@ def test_pattern_helpers():
     assert is_masked_or_placeholder("[REDACTED]")
     assert value_kind("pii_email", "a@b.co") == "email"
     assert normalize_path("$.users[3].password") == "users[*].password"
+
+
+def test_resolve_path_accepts_supplied_identifier_values():
+    path, reason = _resolve_path(
+        "/accounts/{account_id}",
+        None,
+        {"account_id": "7f4d-uuid"},
+    )
+    assert reason is None
+    assert path == "/accounts/7f4d-uuid"
+
+
+def test_resolve_path_fails_closed_without_identifier_value():
+    path, reason = _resolve_path(
+        "/accounts/{account_id}",
+        "probe",
+        {},
+    )
+    assert path is None
+    assert "cannot be resolved safely" in reason

@@ -144,6 +144,7 @@ def run_recon_node(state: WorkflowState, llm_client=None) -> Dict[str, Any]:
             )
             session.add(db_endpoint)
             session.flush()
+            existing_keys.add(key)
             to_classify.append((db_endpoint.id, parsed))
             inserted_count += 1
 

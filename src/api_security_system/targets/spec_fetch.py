@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Sequence
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 import yaml
 
@@ -26,13 +28,17 @@ from api_security_system.request_executor import (
 from .security import (
     ResolvedTarget,
     TargetValidationError,
+    origin_of,
     resolve_target,
     validate_pinned_addresses,
     validate_resolved_target,
 )
 
 MAX_SPEC_BYTES = 5 * 1024 * 1024
-SPEC_TIMEOUT_SECONDS = 15.0
+SPEC_TIMEOUT_SECONDS = 4.0
+MAX_DISCOVERY_PAGES = 20
+MAX_DISCOVERED_ENDPOINTS = 100
+MAX_DISCOVERY_DEPTH = 2
 DISCOVERY_PATHS = (
     "/openapi.json",
     "/openapi.yaml",
@@ -60,14 +66,15 @@ class FetchedSpec:
     source_url: str
     raw: bytes
     extension: str
+    discovery_mode: bool = False
+    limitations: list[str] = field(default_factory=list)
 
 
 def _origin(url: str) -> str:
     try:
-        parts = urlsplit(url)
-    except ValueError:
+        return origin_of(url)
+    except (TargetValidationError, ValueError):
         return ""
-    return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
 
 
 def _safe_url(url: str) -> str:
@@ -181,6 +188,144 @@ def _parse_spec(raw: bytes) -> tuple[dict, str]:
     return document, extension
 
 
+class _HTMLLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+        self.is_html = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "html":
+            self.is_html = True
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if href:
+            self.is_html = True
+            self.links.append(href)
+
+
+def _discovery_scope_path(base_url: str) -> str:
+    return urlsplit(base_url).path.rstrip("/")
+
+
+def _within_discovery_scope(path: str, base_path: str) -> bool:
+    return (
+        not base_path
+        or path == base_path
+        or path.startswith(base_path + "/")
+    )
+
+
+def _discover_html_endpoints(
+    base_url: str,
+    addresses: Sequence[str],
+) -> tuple[dict[str, dict], list[str]]:
+    """Inventory only same-origin GET links exposed by bounded HTML traversal."""
+    base_origin = _origin(base_url)
+    base_path = _discovery_scope_path(base_url)
+    start_url = base_url.rstrip("/") + "/"
+    queue = deque([(start_url, 0)])
+    queued = {start_url}
+    visited: set[str] = set()
+    paths: dict[str, dict] = {}
+    link_queue_truncated = False
+    pages_failed = 0
+    non_html_pages = 0
+    limitations = [
+        "No usable OpenAPI document was found; inventory is limited to "
+        "same-origin HTML links reachable within the bounded crawl."
+    ]
+
+    while queue and len(visited) < MAX_DISCOVERY_PAGES:
+        current_url, depth = queue.popleft()
+        if current_url in visited:
+            continue
+        visited.add(current_url)
+        try:
+            raw = _fetch(current_url, addresses)
+        except SpecUnavailableError:
+            pages_failed += 1
+            continue
+
+        text = raw.decode("utf-8", errors="replace")
+        parser = _HTMLLinkParser()
+        try:
+            parser.feed(text)
+        except ValueError:
+            pages_failed += 1
+            continue
+
+        if not parser.is_html:
+            non_html_pages += 1
+            continue
+
+        current_parts = urlsplit(current_url)
+        current_path = current_parts.path or "/"
+        if _within_discovery_scope(current_path.rstrip("/"), base_path):
+            path_item = paths.setdefault(current_path, {})
+            path_item.setdefault(
+                "get",
+                {
+                    "operationId": f"discovered_get_{len(paths) + 1:03d}",
+                    "responses": {"200": {"description": "Observed HTML route"}},
+                    "x-apivigilante-discovery-source": "html_page",
+                },
+            )
+
+        if depth >= MAX_DISCOVERY_DEPTH:
+            continue
+        for href in parser.links:
+            if len(paths) >= MAX_DISCOVERED_ENDPOINTS:
+                break
+            candidate = urljoin(current_url, href.strip())
+            parts = urlsplit(candidate)
+            if parts.scheme.lower() not in {"http", "https"}:
+                continue
+            if parts.username is not None or parts.password is not None:
+                continue
+            if _origin(candidate) != base_origin:
+                continue
+            path = parts.path or "/"
+            if not _within_discovery_scope(path.rstrip("/"), base_path):
+                continue
+            normalized = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+            if normalized not in queued and normalized not in visited:
+                if len(queued) >= MAX_DISCOVERY_PAGES:
+                    link_queue_truncated = True
+                    continue
+                queued.add(normalized)
+                queue.append((normalized, depth + 1))
+
+    if queue:
+        limitations.append(
+            f"HTML traversal stopped at the {MAX_DISCOVERY_PAGES}-page limit."
+        )
+    if link_queue_truncated:
+        limitations.append(
+            f"HTML link queue stopped at the {MAX_DISCOVERY_PAGES}-page limit."
+        )
+    if pages_failed:
+        limitations.append(
+            f"{pages_failed} page request(s) failed."
+        )
+    if non_html_pages:
+        limitations.append(
+            f"{non_html_pages} successful response(s) did not contain HTML links."
+        )
+    if len(paths) >= MAX_DISCOVERED_ENDPOINTS:
+        limitations.append(
+            f"Endpoint inventory stopped at the {MAX_DISCOVERED_ENDPOINTS}-endpoint limit."
+        )
+    if not paths:
+        limitations.append(
+            "No HTML pages or same-origin links were available to inventory; "
+            "API routes not linked from an HTML page remain undiscovered."
+        )
+
+    return paths, limitations
+
+
 def acquire_spec(
     base_origin: str,
     spec_url: str | None = None,
@@ -246,6 +391,32 @@ def acquire_spec(
             )
         except SpecUnavailableError as exc:
             attempts.append(str(exc))
+
+    if not spec_url:
+        discovered_paths, limitations = _discover_html_endpoints(base, addresses)
+        document = {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Bounded HTML-link discovery",
+                "version": "1.0.0",
+            },
+            "servers": [{"url": base}],
+            "paths": discovered_paths,
+            "x-apivigilante-discovery": {
+                "strategy": "same-origin-html-links",
+                "pages_visited_limit": MAX_DISCOVERY_PAGES,
+                "endpoint_limit": MAX_DISCOVERED_ENDPOINTS,
+            },
+        }
+        raw = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        return FetchedSpec(
+            document=document,
+            source_url=_safe_url(base.rstrip("/") + "/"),
+            raw=raw,
+            extension=".json",
+            discovery_mode=True,
+            limitations=limitations,
+        )
 
     raise SpecUnavailableError(
         "No usable OpenAPI specification was found. Attempted: "

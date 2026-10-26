@@ -16,6 +16,10 @@ class ScanStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    # PARTIAL means the assessment finished, produced an inventory, but one
+    # or more security stages failed. It must not be presented as a clean
+    # completed assessment.
+    PARTIAL = "partial"
     FAILED = "failed"
 
 

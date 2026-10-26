@@ -24,9 +24,10 @@ if TYPE_CHECKING:
     from api_security_system.targets.security import ResolvedTarget
 
 from api_security_system.auth import (
-    AuthContext,
     AuthenticationError,
     AuthModule,
+    AuthProfile,
+    resolve_profile_identities,
 )
 from api_security_system.authz_bola.identity_provisioner import provision_identity
 from api_security_system.authz_bola.schemas import BudgetExceededError
@@ -533,20 +534,38 @@ def _required_input_reason(endpoint: Endpoint) -> Optional[str]:
     return None
 
 
-def _resolve_path(path: str, identity_username: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+def _resolve_path(
+    path: str,
+    identity_username: Optional[str],
+    path_values: Optional[dict[str, str]] = None,
+) -> tuple[Optional[str], Optional[str]]:
     params = _PATH_PARAM.findall(path)
     if not params:
         return path, None
-    if identity_username is None:
-        return None, "Path parameter cannot be resolved without a provisioned identity."
-    if not all(param.lower() in _USERNAME_PARAMS for param in params):
+
+    supplied = path_values or {}
+    unresolved: list[str] = []
+    replacements: dict[str, str] = {}
+    for param in params:
+        if param in supplied:
+            replacements[param] = supplied[param]
+        elif identity_username is not None and param.lower() in _USERNAME_PARAMS:
+            replacements[param] = identity_username
+        else:
+            unresolved.append(param)
+
+    if unresolved:
         return (
             None,
             "Path parameter(s) "
-            + ", ".join(sorted(set(params)))
+            + ", ".join(sorted(set(unresolved)))
             + " cannot be resolved safely; the endpoint was not inspected.",
         )
-    return _PATH_PARAM.sub(identity_username, path), None
+
+    def replace(match):
+        return replacements[match.group(1)]
+
+    return _PATH_PARAM.sub(replace, path), None
 
 
 def _parse_json_body(result: ExecutionResult):
@@ -641,11 +660,16 @@ def run_sensitive_data_check(
     request_budget: int = DEFAULT_SENSITIVE_REQUEST_BUDGET,
     executor_transport=None,
     resolved_target: Optional["ResolvedTarget"] = None,
+    provision_identity_enabled: bool = True,
+    auth_profile: Optional[AuthProfile] = None,
+    authorized_for_active_testing: bool = False,
 ) -> SensitiveDataCheckResult:
     """Inspect in-scope GET responses for inappropriate sensitive data.
 
-    Closed by default: raises PermissionError unless identity
-    registration (active testing) is explicitly approved.
+    Closed by default: raises PermissionError unless active testing is
+    explicitly approved. ``provision_identity_enabled=False`` inspects only
+    unauthenticated GET responses when the target does not expose a
+    supported identity contract; it never guesses an auth flow.
     """
     if not allow_identity_registration:
         raise PermissionError(
@@ -664,15 +688,19 @@ def run_sensitive_data_check(
 
     from api_security_system.targets.security import (
         authorized_origins,
-        is_authorized_origin,
+        is_active_test_authorized,
         resolve_target,
         validate_resolved_target,
     )
 
-    if not is_authorized_origin(base_url):
+    if not is_active_test_authorized(
+        base_url,
+        authorized_for_active_testing=authorized_for_active_testing,
+    ):
         raise TargetOriginError(
-            "Sensitive-data checks are only authorized against the explicitly "
-            f"allowlisted origins {sorted(authorized_origins())}, got {base_url!r}."
+            "Sensitive-data checks require an explicitly allowlisted origin "
+            f"{sorted(authorized_origins())} or per-assessment authorization "
+            f"with the operator opt-in enabled, got {base_url!r}."
         )
 
     if executor_transport is None:
@@ -705,16 +733,58 @@ def run_sensitive_data_check(
     )
 
     try:
-        identity = None
-        identity_ctx: Optional[AuthContext] = None
-        try:
-            identity, identity_ctx, _ = provision_identity(
-                auth, scan_id, "sensitive_data_probe"
-            )
-        except (AuthenticationError, TransportError, BudgetExceededError) as exc:
+        identity_id: Optional[int] = None
+        identity_name: Optional[str] = None
+        identity_headers: Optional[dict[str, str]] = None
+        identity_path_values: dict[str, str] = {}
+
+        if auth_profile is not None:
+            if auth_profile.type == "none":
+                result.reason = (
+                    "Anonymous auth profile selected; only unauthenticated "
+                    "GET endpoints were inspected."
+                )
+            else:
+                try:
+                    profile_identities = resolve_profile_identities(
+                        auth_profile,
+                        executor,
+                        scan_id,
+                        "sensitive_data",
+                        limit=1,
+                    )
+                except (AuthenticationError, TransportError, BudgetExceededError, ValueError) as exc:
+                    result.reason = (
+                        "Could not resolve an inspection identity from the auth "
+                        f"profile ({type(exc).__name__}); authenticated endpoints "
+                        "were not inspected."
+                    )
+                else:
+                    if profile_identities:
+                        selected = profile_identities[0]
+                        identity_id = selected.identity_id
+                        identity_name = selected.username
+                        identity_headers = dict(selected.headers)
+                        identity_path_values = dict(selected.path_values)
+        elif provision_identity_enabled:
+            try:
+                identity, identity_ctx, _ = provision_identity(
+                    auth, scan_id, "sensitive_data_probe"
+                )
+            except (AuthenticationError, TransportError, BudgetExceededError) as exc:
+                result.reason = (
+                    "Could not provision an inspection identity ("
+                    f"{type(exc).__name__}); authenticated endpoints were not inspected."
+                )
+            else:
+                identity_id = identity.id
+                identity_name = identity.description
+                identity_headers = {"Authorization": identity_ctx.auth_header_value}
+        else:
             result.reason = (
-                "Could not provision an inspection identity ("
-                f"{type(exc).__name__}); authenticated endpoints were not inspected."
+                "No supported identity contract was detected and no auth "
+                "profile was supplied; only unauthenticated GET endpoints "
+                "were inspected."
             )
 
         endpoints = _select_get_endpoints(scan_id)
@@ -750,14 +820,15 @@ def run_sensitive_data_check(
 
             path, path_error = _resolve_path(
                 endpoint.path,
-                identity.description if identity is not None else None,
+                identity_name,
+                identity_path_values,
             )
             if path_error:
                 result.results.append(_unsupported(endpoint, path_error))
                 continue
 
             auth_required = bool(fragment.get("security"))
-            if auth_required and identity_ctx is None:
+            if auth_required and identity_headers is None:
                 result.results.append(
                     _unsupported(
                         endpoint,
@@ -769,8 +840,8 @@ def run_sensitive_data_check(
                 continue
 
             headers = (
-                {"Authorization": identity_ctx.auth_header_value}
-                if auth_required and identity_ctx is not None
+                dict(identity_headers)
+                if auth_required and identity_headers is not None
                 else {}
             )
             auth_mode = "authenticated" if auth_required else "anonymous"
@@ -824,7 +895,7 @@ def run_sensitive_data_check(
                 endpoint_path=endpoint.path,
                 operation_id=endpoint.operation_id,
                 authenticated=bool(headers),
-                identity_username=identity.description if identity is not None else None,
+                identity_username=identity_name,
                 declared_fields=declared_fields,
                 token_issuance=_is_token_issuance(endpoint),
             )
@@ -832,7 +903,7 @@ def run_sensitive_data_check(
             execution_id = _persist_evidence(
                 scan_id,
                 endpoint.id,
-                identity.id if headers and identity is not None else None,
+                identity_id if headers and identity_id is not None else None,
                 response,
                 body,
             )

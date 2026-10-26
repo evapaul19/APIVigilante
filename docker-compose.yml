@@ -3,17 +3,103 @@ services:
     image: postgres:17
     environment:
       POSTGRES_USER: api_security
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: api_security
     ports:
-      - "5432:5432"
+      # Host port is configurable because 5432 is often already in use.
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U api_security"]
+      test: ["CMD-SHELL", "pg_isready -U api_security -d api_security"]
       interval: 2s
       timeout: 3s
-      retries: 10
+      retries: 15
+
+  # Runs the additive migrations once and exits before the API starts.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://api_security:${POSTGRES_PASSWORD}@postgres:5432/api_security
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "api_security_system.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://api_security:${POSTGRES_PASSWORD}@postgres:5432/api_security
+      APIVIGILANTE_CORS_ORIGINS: ${APIVIGILANTE_CORS_ORIGINS:-http://localhost:8080}
+      APIVIGILANTE_AUTHORIZED_ORIGINS: ${APIVIGILANTE_AUTHORIZED_ORIGINS:-}
+      APIVIGILANTE_ALLOW_USER_AUTHORIZED_TARGETS: ${APIVIGILANTE_ALLOW_USER_AUTHORIZED_TARGETS:-}
+      APIVIGILANTE_ENABLE_TEST_TARGET: ${APIVIGILANTE_ENABLE_TEST_TARGET:-}
+      APIVIGILANTE_TEST_TARGET_ORIGINS: ${APIVIGILANTE_TEST_TARGET_ORIGINS:-http://127.0.0.1:5001}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      VAMPI_ADMIN_USERNAME: ${VAMPI_ADMIN_USERNAME:-}
+      VAMPI_ADMIN_PASSWORD: ${VAMPI_ADMIN_PASSWORD:-}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Optional local verification target. It is NOT part of the default stack:
+  # run `docker compose --profile test up --build` to enable it. The container
+  # shares the backend network namespace so the backend can reach the bundled
+  # test API on its own loopback address, which is the only origin the
+  # test-only allowlist accepts.
+  test-target:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: "service:backend"
+    command: ["uvicorn", "vulnerable_test_api.app:app", "--host", "127.0.0.1", "--port", "5001"]
+    volumes:
+      - ./vulnerable_test_api:/app/vulnerable_test_api:ro
+    depends_on:
+      backend:
+        condition: service_healthy
 
 volumes:
   pg_data:

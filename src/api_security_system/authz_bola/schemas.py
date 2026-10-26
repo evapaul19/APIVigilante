@@ -37,6 +37,7 @@ class BolaCandidate(BaseModel):
     path: str
     operation_id: Optional[str] = None
     id_param_name: str
+    path_params: list[str] = Field(default_factory=list)
     summary: Optional[str] = None
     description: Optional[str] = None
 
